@@ -4,11 +4,11 @@
 
 **LLMPSP** allows you to run a 90M parameter language model directly on the PSP.
 
-It is not streamed from a server or from an API, this is a full 90M conversational LLM running locally on the PSP. The model weights are stored on the Memory Stick, loaded by the PSP itself, and all inference is done on the PSP's 333 MHz MIPS CPU.
+It is not streamed from a server or from an API, this is a full 90M conversational LLM running locally on the PSP. The model weights are stored on the Memory Stick, loaded by the PSP itself and all inference is done on the PSP's 333 MHz MIPS CPU.
 
-The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. It runs on the PSP-2000 and PSP-3000 with custom firmware. (PSP 1000 is not supported due to only having 32MB of RAM)
+The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. It runs on any PSP with 64 MB of RAM with custom firmware. (PSP 1000 is not supported due to only having 32MB of RAM)
 
-Performance is obviously nowhere near a modern computer, but it is fast enough to be somewhat useable. On a PSP-3000 it generates roughly 0.5 tokens per second, and the model is capable of answering simple questions, following basic instructions, and generating short pieces of text.
+Performance is obviously nowhere near a modern computer, but it is fast enough to be somewhat useable. On a PSP-3000 it generates about 0.5 tokens per second and the model is capable of answering simple questions, following basic instructions, and generating short pieces of text and even writing code (see examples below).
 
 ## Install
 
@@ -16,9 +16,9 @@ Performance is obviously nowhere near a modern computer, but it is fast enough t
 2. Copy the whole `LLMPSP` folder to `ms0:/PSP/GAME/` on your memory stick.
 3. Launch **LLMPSP** from Game → Memory Stick.
 
-You need a PSP-2000 or PSP-3000 running CFW (ARK-4, PRO, ME - anything current). A PSP-1000 only has 32 MB of RAM and it won't work.
+You need a PSP-2000/PSP-3000/Street/GO running CFW (ARK-4, ARK-5, PRO, ME - anything current). A PSP-1000 only has 32 MB of RAM and it won't work.
 
-Settings live in `llmpsp_config.cfg` next to the EBOOT: cache size, context length, sampling temperature, reply length cap, CPU clock. The defaults are right for a stock PSP-2000/3000.
+Settings live in `llmpsp_config.cfg` next to the EBOOT: cache size, context length, sampling temperature, reply length cap, CPU clock. The defaults are ok for a stock PSP but you can always tweak them and try different settings.
 
 ## How it works
 
