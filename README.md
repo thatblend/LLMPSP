@@ -4,11 +4,11 @@
 
 **LLMPSP** allows you to run a 90M parameter language model directly on the PSP.
 
-It is not streamed from a server or from an API, this is a full 90M conversational LLM running locally on the PSP. The model weights are stored on the Memory Stick, loaded by the PSP itself and all inference is done on the PSP's 333 MHz MIPS CPU.
+It is not streamed from a server or from an API, it's a full 90M conversational LLM running locally on the PSP. The model weights are stored on the Memory Stick, loaded by the PSP itself and all inference is done on the PSP's 333 MHz MIPS CPU.
 
-The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. It runs on any PSP with 64 MB of RAM with custom firmware. (PSP 1000 is not supported due to only having 32MB of RAM)
+The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. This model is actually a lot more capable than the 90M parameter could would suggest and it can answer basic questions, has some decent general knowledge and can generate poems, short stories, draft your work email (good luck) or write code (that doesn't work). It's not really useful for anything, but it's fun to actually see a half-decent model working locally on the PSP.
 
-Performance is obviously nowhere near a modern computer, but it is fast enough to be somewhat useable. On a PSP-3000 it generates about 0.5 tokens per second and the model is capable of answering simple questions, following basic instructions, and generating short pieces of text and even writing code (see examples below).
+Don't expect good performance as it has to load part of the model from the memory stick, but it is fast enough to be somewhat useable. On a PSP-3000 it generates about 0.5 - 0.6 tokens per second, perhaps more if you use CPU overclock.
 
 ## Install
 
