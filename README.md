@@ -6,7 +6,7 @@
 
 It is not streamed from a server or from an API, it's a full 90M conversational LLM running locally on the PSP. The model weights are stored on the Memory Stick, loaded by the PSP itself and all inference is done on the PSP's 333 MHz MIPS CPU.
 
-The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. This model is actually a lot more capable than the 90M parameter could would suggest and it can answer basic questions, has some decent general knowledge and can generate poems, short stories, draft your work email (good luck) or write code (that doesn't work). It's not really useful for anything, but it's fun to actually see a half-decent model working locally on the PSP.
+The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. This model is actually a lot more capable than the 90M parameter count would suggest and it can answer basic questions, has some decent general knowledge and can generate poems, short stories, draft your work email (good luck) or write code (that doesn't work). It's not really useful for anything, but it's fun to actually see a half-decent model working locally on the PSP.
 
 Don't expect good performance as it has to load part of the model from the memory stick, but it is fast enough to be somewhat useable. On a PSP-3000 it generates about 0.5 - 0.6 tokens per second, perhaps more if you use CPU overclock.
 
