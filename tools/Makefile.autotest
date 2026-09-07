@@ -1,0 +1,18 @@
+TARGET = LLMPSPTest
+OBJS = tools/main_psp_autotest.o src/falcon_h1.o src/falcon_q4_psp.o src/falcon_prefetch_psp.o src/falcon_tokenizer.o src/falcon_sampler.o
+
+INCDIR = include
+CFLAGS = -O3 -G0 -Wall -Wextra -std=c99 -fno-math-errno
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+ASFLAGS = $(CFLAGS)
+# Never -lpspkernel here: see the LIBS note in the top-level Makefile.
+LIBS = -lpsppower -lm
+
+BUILD_PRX = 1
+PSP_FW_VERSION = 660
+PSP_LARGE_MEMORY = 1
+EXTRA_TARGETS = EBOOT.PBP
+PSP_EBOOT_TITLE = LLMPSP Self Test
+
+PSPSDK := $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak

@@ -1,0 +1,15 @@
+MODEL NOTICE
+
+Model: Falcon-H1-Tiny-90M-Instruct
+Developer: Technology Innovation Institute (TII)
+Source: https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct
+Architecture: Falcon-H1 hybrid Transformer + Mamba, approximately 90M parameters
+
+The model weights and converted model.fhq4 are NOT covered by this project's
+MIT source-code license. They are governed by the Falcon LLM License:
+
+https://falconllm.tii.ae/falcon-terms-and-conditions.html
+
+Review and comply with those terms before using or redistributing the model or
+a converted copy. This project is an independent compatibility implementation
+and is not affiliated with or endorsed by TII.

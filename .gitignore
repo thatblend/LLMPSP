@@ -1,0 +1,29 @@
+# Canonical runtime artifacts kept locally but regenerated/versioned separately.
+/model.fhq4
+/model.fhq4.json
+
+# Downloaded checkpoints and generated packages.
+/_model_falcon90/
+/models/
+/build/
+/release/
+
+# PSP/host compiler output.
+*.o
+*.obj
+*.elf
+*.prx
+*.exe
+*.zip
+/PARAM.SFO
+
+# Device/runtime diagnostics and local overrides.
+llmpsp_trace.txt
+falcon_autotest_log.txt
+vfpu_unit_log.txt
+cache_mb.txt
+cpu_mhz.txt
+
+# Python cache.
+__pycache__/
+*.py[cod]

@@ -1,0 +1,17 @@
+TARGET = VfpuUnit
+OBJS = tools/vfpu_unittest_psp.o src/falcon_q4_psp.o
+
+INCDIR = include
+CFLAGS = -O2 -G0 -Wall -Wextra -std=c99 -fno-math-errno
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+ASFLAGS = $(CFLAGS)
+# Never -lpspkernel here: see the LIBS note in the top-level Makefile.
+LIBS = -lm
+
+BUILD_PRX = 1
+PSP_FW_VERSION = 660
+EXTRA_TARGETS = EBOOT.PBP
+PSP_EBOOT_TITLE = VFPU Unit Test
+
+PSPSDK := $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak
