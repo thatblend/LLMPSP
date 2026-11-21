@@ -57,7 +57,7 @@ int main(void) {
     FalconUiState state;
     int bad;
     memset(&state, 0, sizeof(state));
-    state.context_total = 512;
+    state.context_total = 384;   /* the app default (PROJECT.md 2.9) */
     bad = check_pixel_rows();
 
     /* 1. Fresh start, nothing typed yet. */

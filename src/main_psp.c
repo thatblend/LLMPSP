@@ -327,9 +327,15 @@ typedef struct {
     int stripe;          /* 1 = spread cache holes across layers; only
                           * sensible together with prefetch on hardware
                           * whose card reads truly overlap compute */
-    int context;         /* 128..512; smaller frees KV RAM for the cache */
+    int context;         /* 128..1024, default 384; smaller frees KV RAM
+                          * for the cache. Startup backs off further if
+                          * the runtime state does not fit. */
+    int fit;             /* 1 = give up to 25% of the context if that lets
+                          * every weight block be cached (section 2.10) */
+    int state_f16;       /* 1 = Mamba recurrent state as float16 */
     int top_k;           /* 1..64 */
-    int max_reply_tokens;/* 8..256 per reply */
+    int max_reply_tokens;/* 8..1024 per reply; the context still bounds it */
+    int keyboard;        /* UI_LAYOUT_ABC or UI_LAYOUT_QWERTY */
     float temperature;   /* 0 = deterministic greedy */
     float top_p;
     float repetition_penalty;
@@ -355,10 +361,13 @@ static void load_config(const char *model_path, AppConfig *cfg) {
     cfg->volatile_mem = 1;
     cfg->prefetch = 0;
     cfg->stripe = 0;
-    cfg->context = 512;
+    cfg->context = 384;
+    cfg->fit = 1;
+    cfg->state_f16 = 1;
     cfg->top_k = 32;
-    cfg->max_reply_tokens = 128;
-    cfg->temperature = 0.0f;
+    cfg->max_reply_tokens = 384;
+    cfg->keyboard = UI_LAYOUT_ABC;
+    cfg->temperature = 0.3f;
     cfg->top_p = 0.9f;
     cfg->repetition_penalty = 1.08f;
     if (strlen(model_path) + 24 < sizeof(path)) {
@@ -383,9 +392,16 @@ static void load_config(const char *model_path, AppConfig *cfg) {
                 else if (!strcmp(key, "stripe"))
                     cfg->stripe = atoi(value) != 0;
                 else if (!strcmp(key, "context")) cfg->context = atoi(value);
+                else if (!strcmp(key, "fit")) cfg->fit = atoi(value) != 0;
+                else if (!strcmp(key, "state_f16"))
+                    cfg->state_f16 = atoi(value) != 0;
                 else if (!strcmp(key, "top_k")) cfg->top_k = atoi(value);
                 else if (!strcmp(key, "max_reply_tokens"))
                     cfg->max_reply_tokens = atoi(value);
+                else if (!strcmp(key, "keyboard"))
+                    cfg->keyboard = (value[0] == 'q' || value[0] == 'Q' ||
+                                     value[0] == '1') ?
+                                    UI_LAYOUT_QWERTY : UI_LAYOUT_ABC;
                 else if (!strcmp(key, "temperature"))
                     cfg->temperature = (float)atof(value);
                 else if (!strcmp(key, "top_p"))
@@ -398,9 +414,11 @@ static void load_config(const char *model_path, AppConfig *cfg) {
     }
     cfg->cache_mb = clamp_int(cfg->cache_mb, 0, 46);
     cfg->cpu_mhz = clamp_int(cfg->cpu_mhz, 100, 333);
-    cfg->context = clamp_int(cfg->context, 128, 512);
+    cfg->context = clamp_int(cfg->context, FALCON_MIN_CONTEXT,
+                             FALCON_MAX_CONTEXT);
     cfg->top_k = clamp_int(cfg->top_k, 1, 64);
-    cfg->max_reply_tokens = clamp_int(cfg->max_reply_tokens, 8, 256);
+    cfg->max_reply_tokens = clamp_int(cfg->max_reply_tokens, 8,
+                                      FALCON_MAX_CONTEXT);
     cfg->temperature = clamp_float(cfg->temperature, 0.0f, 2.0f);
     cfg->top_p = clamp_float(cfg->top_p, 0.05f, 1.0f);
     cfg->repetition_penalty =
@@ -465,7 +483,7 @@ int main(int argc, char **argv) {
     char error[192], model_path[512];
     char prompt[PROMPT_BYTES] = "";
     int tokens[TOKEN_CAPACITY];
-    int conv_position = 0, conv_pending = -1;
+    int conv_position = 0, conv_pending = -1, requested_context;
     int lock_rc, guard_rc, scroll_hold = 0, draft_changed = 0;
     unsigned int previous = 0;
     SceCtrlData pad;
@@ -481,7 +499,7 @@ int main(int argc, char **argv) {
      * suspending with CFW extra RAM in use is not survivable. */
     lock_rc = scePowerLock(0);
 
-    pspDebugScreenPrintf("Falcon-H1 Tiny 90M  v1.1\nStarting...\n");
+    pspDebugScreenPrintf("Falcon-H1 Tiny 90M  v1.4\nStarting...\n");
     trace_open(argc, argv);
     if (!locate_model(model_path, sizeof(model_path), argc, argv)) {
         trace_line("[fail] model.fhq4 not found");
@@ -491,15 +509,16 @@ int main(int argc, char **argv) {
         sceKernelExitGame();
         return 1;
     }
-    trace_line("=== boot LLMPSP v1.1 ===");
+    trace_line("=== boot LLMPSP v1.4 ===");
     trace_line("[stage] power lock rc 0x%08x, guard thread 0x%08x",
                lock_rc, guard_rc);
     load_config(model_path, &config);
     trace_line("[cfg] cache %d MiB, %d MHz, volatile %d, prefetch %d, "
-               "stripe %d, ctx %d, temp %d.%02d, max reply %d",
+               "stripe %d, ctx %d, fit %d, state_f16 %d, temp %d.%02d, "
+               "max reply %d",
                config.cache_mb, config.cpu_mhz, config.volatile_mem,
-               config.prefetch, config.stripe, config.context,
-               (int)config.temperature,
+               config.prefetch, config.stripe, config.context, config.fit,
+               config.state_f16, (int)config.temperature,
                (int)(config.temperature * 100.0f) % 100,
                config.max_reply_tokens);
     {
@@ -520,21 +539,38 @@ int main(int argc, char **argv) {
         sceKernelExitGame();
         return 1;
     }
-    trace_line("[stage] model open ok");
+    trace_line("[stage] model open ok, raw stream %d",
+               model.stream_fd >= 0);
     /* A smaller context shrinks the KV cache before runtime_init, which
      * frees heap that the weight cache then claims automatically. */
-    if (config.context < model.config.context)
-        model.config.context = config.context;
+    model.config.context = config.context;
+    falcon_ui_set_layout(config.keyboard);
+    model.state_mode = config.state_f16 ? FALCON_STATE_F16 : FALCON_STATE_F32;
     pspDebugScreenPrintf("Model tables: %.2f MiB\n",
                          (double)falcon_model_resident_bytes(&model) / 1048576.0);
-    pspDebugScreenPrintf("Allocating recurrent state and 512-token cache...\n");
-    if (!falcon_runtime_init(&runtime, &model, error, sizeof(error))) {
-        trace_line("[fail] runtime init: %s", error);
-        trace_sync();
-        falcon_model_close(&model);
-        fatal_screen("There is not enough memory to start the model.", error);
-        sceKernelExitGame();
-        return 1;
+    pspDebugScreenPrintf("Allocating recurrent state and %d-token cache...\n",
+                         model.config.context);
+    {
+        /* If the runtime state does not fit (a console with less free
+         * RAM), back off in 16-token steps and run with the largest
+         * context that fits instead of refusing to start. Everything
+         * downstream reads model.config.context, the granted value. */
+        int granted;
+        requested_context = model.config.context;
+        granted = falcon_runtime_init_fit(&runtime, &model,
+                                          FALCON_MIN_CONTEXT, 16,
+                                          error, sizeof(error));
+        trace_line("[stage] context requested %d, granted %d",
+                   requested_context, granted);
+        if (!granted) {
+            trace_line("[fail] runtime init: %s", error);
+            trace_sync();
+            falcon_model_close(&model);
+            fatal_screen("There is not enough memory to start the model.",
+                         error);
+            sceKernelExitGame();
+            return 1;
+        }
     }
     trace_line("[stage] runtime init ok, %u KiB",
                (unsigned)(falcon_runtime_resident_bytes(&runtime) / 1024));
@@ -584,6 +620,46 @@ int main(int argc, char **argv) {
                                            (prefetch_ready && config.stripe) ?
                                                1 : 0,
                                            error, sizeof(error));
+        trace_line("[stage] cache filled, %u KiB, %d blocks uncached",
+                   (unsigned)(cached / 1024),
+                   falcon_model_uncached_blocks(&model));
+        if (cache_mib > 0) {
+            /* Fit policy (section 2.10): if blocks stayed on the card and
+             * giving up at most 25% of the requested context frees enough
+             * RAM, run with the largest such context and cache all. */
+            char reason[128];
+            int floor_context = requested_context - requested_context / 4;
+            int before = model.config.context, granted;
+            if (floor_context < FALCON_MIN_CONTEXT)
+                floor_context = FALCON_MIN_CONTEXT;
+            if (config.fit) {
+                granted = falcon_fit_context(&model, &runtime,
+                                             before - floor_context,
+                                             FALCON_MIN_CONTEXT,
+                                             reason, sizeof(reason));
+            } else {
+                granted = before;
+                snprintf(reason, sizeof(reason), "fit = 0 in config");
+            }
+            trace_line("[stage] fit: context requested %d, granted %d (%s)",
+                       requested_context, granted, reason);
+            if (!granted) {
+                trace_line("[fail] runtime restore after fit");
+                trace_sync();
+                falcon_model_close(&model);
+                fatal_screen("There is not enough memory to start the model.",
+                             reason);
+                sceKernelExitGame();
+                return 1;
+            }
+            cached = model.weight_cache_bytes;
+        }
+        /* The 128 KiB raw read window exists only if something streams. */
+        trace_line("[stage] raw read window %s",
+                   falcon_model_stream_prepare(&model) ?
+                       (model.stream_ready ? "allocated" : "not needed") :
+                       "unavailable, stdio streaming");
+        cached = model.weight_cache_bytes;
         for (i = 0; i < model.weight_cache_blocks; ++i)
             if (!model.weight_cache[i]) ++holes;
         if (prefetch_ready) {
@@ -719,8 +795,14 @@ int main(int argc, char **argv) {
                 turn_tokens = append_tokens(&model, "assistant\n",
                                             tokens, turn_tokens);
             }
-            if (turn_tokens <= 0 || turn_tokens >= TOKEN_CAPACITY) {
-                set_status("That message is too long for the 512-token space.");
+            /* model.config.context is the granted context (startup may
+             * have backed off below the configured one). A turn needs
+             * room for at least 8 reply tokens after its own tokens. */
+            if (turn_tokens <= 0 || turn_tokens >= TOKEN_CAPACITY ||
+                (conv_position == 0 &&
+                 turn_tokens + 8 > model.config.context)) {
+                set_status("That message is too long for the %d-token space.",
+                           model.config.context);
                 ui_refresh();
                 continue;
             }
@@ -788,11 +870,12 @@ int main(int argc, char **argv) {
              * (forward - matvec) is attention/mamba/norm/misc; the rest of
              * elapsed is sampling, UI, and trace overhead. */
             trace_line("[perf] forward %u ms, matvec %u ms, streamed %u KiB, "
-                       "prompt %u ms, reply %u ms",
+                       "prompt %u ms, reply %u ms, realigned %u",
                        runtime.forward_us / 1000u, runtime.matvec_us / 1000u,
                        (unsigned)(runtime.streamed_bytes / 1024u),
                        (elapsed - reply_elapsed) / 1000u,
-                       reply_elapsed / 1000u);
+                       reply_elapsed / 1000u,
+                       (unsigned)runtime.realigned_groups);
             {
                 unsigned int pf_kib, pf_wait;
                 int pf_alive;

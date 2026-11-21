@@ -28,7 +28,38 @@ static const char lower_keys[] =
 static const char upper_keys[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?'-_:;/()@#$%&*+=[]<>";
 
+/* PC-style alternative: the number row and the three letter rows keep
+ * their QWERTY places in the first ten columns (with - = [ ] ; ' , . /
+ * where a PC has them), and the remaining symbols fill the columns to the
+ * right. Same 60 characters as the alphabetical layout. */
+static const char qwerty_lower_keys[] =
+    "1234567890-=_+@"
+    "qwertyuiop[]()#"
+    "asdfghjkl;:'!?$"
+    "zxcvbnm,./<>%&*";
+static const char qwerty_upper_keys[] =
+    "1234567890-=_+@"
+    "QWERTYUIOP[]()#"
+    "ASDFGHJKL;:'!?$"
+    "ZXCVBNM,./<>%&*";
+
+/* Every layout must fill the grid exactly. */
+typedef char falcon_ui_check_abc[
+    sizeof(lower_keys) == UI_KEY_COUNT + 1 &&
+    sizeof(upper_keys) == UI_KEY_COUNT + 1 ? 1 : -1];
+typedef char falcon_ui_check_qwerty[
+    sizeof(qwerty_lower_keys) == UI_KEY_COUNT + 1 &&
+    sizeof(qwerty_upper_keys) == UI_KEY_COUNT + 1 ? 1 : -1];
+
+static int key_layout;
+
+void falcon_ui_set_layout(int layout) {
+    key_layout = layout == UI_LAYOUT_QWERTY ? UI_LAYOUT_QWERTY : UI_LAYOUT_ABC;
+}
+
 const char *falcon_ui_keys(int upper) {
+    if (key_layout == UI_LAYOUT_QWERTY)
+        return upper ? qwerty_upper_keys : qwerty_lower_keys;
     return upper ? upper_keys : lower_keys;
 }
 

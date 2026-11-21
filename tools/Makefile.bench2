@@ -1,0 +1,39 @@
+# Second on-device benchmark EBOOT (tools/bench2_psp.c), "LLMPSP Bench 2".
+#
+# Run from its own directory, like Makefile.bench, so nothing lands in the
+# repository root:
+#
+#     mkdir -p build/bench2
+#     make -C build/bench2 -f ../../tools/Makefile.bench2
+#     make -C build/bench2 -f ../../tools/Makefile.bench2 package
+#
+# "package" stages build/LLMPSPBench2, the folder to copy to ms0:/PSP/GAME/.
+# Self-contained: no object from src/ is linked.
+ROOT ?= ../..
+VPATH = $(ROOT)/tools
+
+TARGET = LLMPSPBench2
+OBJS = bench2_psp.o bench2_micro.o bench2_kernels.o
+
+CFLAGS = -O3 -G0 -Wall -Wextra -std=c99 -fno-math-errno
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+ASFLAGS = $(CFLAGS)
+# Never -lpspkernel here: see the LIBS note in the top-level Makefile.
+LIBS = -lpsppower -lm
+
+BUILD_PRX = 1
+PSP_FW_VERSION = 660
+PSP_LARGE_MEMORY = 1
+EXTRA_TARGETS = EBOOT.PBP
+PSP_EBOOT_TITLE = LLMPSP Bench 2
+
+PSPSDK := $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak
+
+$(OBJS): $(ROOT)/tools/bench2.h
+
+.PHONY: package
+package: EBOOT.PBP
+	mkdir -p $(ROOT)/build/LLMPSPBench2
+	cp EBOOT.PBP $(ROOT)/build/LLMPSPBench2/EBOOT.PBP
+	@echo "Copy build/LLMPSPBench2 to ms0:/PSP/GAME/"

@@ -44,6 +44,9 @@ int main(int argc, char **argv) {
     if (!falcon_model_open(&model, argv[1], error, sizeof(error))) {
         fprintf(stderr, "model: %s\n", error); return 1;
     }
+    /* App default float16 state; STATE_F16=0 probes the float32 state. */
+    model.state_mode = getenv("STATE_F16") && !atoi(getenv("STATE_F16")) ?
+                       FALCON_STATE_F32 : FALCON_STATE_F16;
     if (!falcon_runtime_init(&rt, &model, error, sizeof(error))) {
         fprintf(stderr, "runtime: %s\n", error); return 1;
     }

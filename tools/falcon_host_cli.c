@@ -40,6 +40,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "model: %s\n", error);
         return 1;
     }
+    /* Like the app's default (state_f16 = 1); STATE_F16=0 selects the
+     * float32 Mamba state. */
+    model.state_mode = getenv("STATE_F16") && !atoi(getenv("STATE_F16")) ?
+                       FALCON_STATE_F32 : FALCON_STATE_F16;
     if (!falcon_runtime_init(&runtime, &model, error, sizeof(error))) {
         fprintf(stderr, "runtime: %s\n", error);
         falcon_model_close(&model);

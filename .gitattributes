@@ -1,0 +1,3 @@
+# Shell scripts run under bash in the PSP toolchain environment (WSL or
+# Docker), where a CRLF line ending breaks the shebang and every command.
+*.sh text eol=lf

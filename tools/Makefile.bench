@@ -1,0 +1,41 @@
+# On-device benchmark EBOOT (tools/bench_psp.c).
+#
+# Unlike the other tool Makefiles this one is run from its own directory,
+# so its EBOOT.PBP / PARAM.SFO / objects never land in the repository root
+# (where they would overwrite the app's EBOOT.PBP):
+#
+#     mkdir -p build/bench
+#     make -C build/bench -f ../../tools/Makefile.bench
+#     make -C build/bench -f ../../tools/Makefile.bench package
+#
+# "package" stages build/LLMPSPBench, the folder to copy to ms0:/PSP/GAME/.
+ROOT ?= ../..
+VPATH = $(ROOT)/tools $(ROOT)/src
+
+TARGET = LLMPSPBench
+# q4_tile_psp.o: the version-2 tile kernels (vtfm4, the v1.3 app kernel,
+# and the vdot cross-check variant); q4_row_psp.o: the old version-1 row
+# kernel. The benchmark measures the FHQ4 version-2 kernels only.
+OBJS = bench_psp.o q4_tile_psp.o q4_row_psp.o
+
+INCDIR = $(ROOT)/include
+CFLAGS = -O3 -G0 -Wall -Wextra -std=c99 -fno-math-errno
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
+ASFLAGS = $(CFLAGS)
+# Never -lpspkernel here: see the LIBS note in the top-level Makefile.
+LIBS = -lpsppower -lm
+
+BUILD_PRX = 1
+PSP_FW_VERSION = 660
+PSP_LARGE_MEMORY = 1
+EXTRA_TARGETS = EBOOT.PBP
+PSP_EBOOT_TITLE = LLMPSP Bench
+
+PSPSDK := $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak
+
+.PHONY: package
+package: EBOOT.PBP
+	mkdir -p $(ROOT)/build/LLMPSPBench
+	cp EBOOT.PBP $(ROOT)/build/LLMPSPBench/EBOOT.PBP
+	@echo "Copy build/LLMPSPBench to ms0:/PSP/GAME/"

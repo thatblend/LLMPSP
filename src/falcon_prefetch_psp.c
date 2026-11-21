@@ -20,7 +20,8 @@
  *
  * All calls happen on the inference thread. Any error permanently
  * disables the module; q4_matvec then falls back to its synchronous
- * fread path, which stays fully correct. */
+ * path (raw read window, or stdio), which stays fully correct. Requests
+ * are whole Q4 tile groups (FHQ4 version 2). */
 #include "falcon_h1.h"
 
 #if defined(_PSP_FW_VERSION) && !defined(FALCON_NO_PREFETCH)
@@ -32,7 +33,12 @@
 
 #define PF_CHUNK (256u * 1024u)
 #define PF_BUFFERS 3
-#define PF_MAX_ROW 1024
+/* Largest request served: one Q4 tile group (4 rows; 1728 bytes at 768
+ * columns). Served pointers are 16-byte aligned because the buffers are
+ * 64-aligned and every buffer offset and group offset is 16-aligned
+ * (extents start on cache-block boundaries of the 16-aligned weight
+ * region); pf_assemble is aligned too. q4_matvec still guards. */
+#define PF_MAX_ROW 2048
 #define PF_MAX_EXTENTS 224
 /* Above the main thread (0x20), below the power guard (0x18) and the
  * callback thread (0x11). */

@@ -21,9 +21,13 @@
 llmpsp_trace.txt
 falcon_autotest_log.txt
 vfpu_unit_log.txt
+bench_log.txt
 cache_mb.txt
 cpu_mhz.txt
 
 # Python cache.
 __pycache__/
 *.py[cod]
+bench2_log.txt
+bench2_quick.txt
+/HANDOFF.md

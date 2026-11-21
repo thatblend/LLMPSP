@@ -37,12 +37,18 @@ int main(int argc, char **argv) {
     char error[256];
     int turn1[512], turn2[512], full[512];
     int turn1_count, turn2_count, full_count;
-    int generated, next_position, pending, i, ok;
+    int generated, next_position, pending, pending1, i, ok;
     TokenList reply1, reply2_inc, reply2_full;
     const char *user1 = "hi", *user2 = "what can you do";
     if (argc < 2) { fprintf(stderr, "usage: %s model\n", argv[0]); return 2; }
-    if (!falcon_model_open(&model, argv[1], error, sizeof(error)) ||
-        !falcon_runtime_init(&runtime, &model, error, sizeof(error))) {
+    if (!falcon_model_open(&model, argv[1], error, sizeof(error))) {
+        fprintf(stderr, "setup: %s\n", error);
+        return 1;
+    }
+    /* App default float16 state; STATE_F16=0 tests the float32 state. */
+    model.state_mode = getenv("STATE_F16") && !atoi(getenv("STATE_F16")) ?
+                       FALCON_STATE_F32 : FALCON_STATE_F16;
+    if (!falcon_runtime_init(&runtime, &model, error, sizeof(error))) {
         fprintf(stderr, "setup: %s\n", error);
         return 1;
     }
@@ -62,6 +68,8 @@ int main(int argc, char **argv) {
 
     /* Turn 2 incrementally (exactly the PSP frontend's delta). */
     turn2_count = 0;
+    /* turn 2 overwrites pending; the full re-evaluation needs turn 1's. */
+    pending1 = pending;
     if (pending >= 0) turn2[turn2_count++] = pending;
     turn2[turn2_count++] = model.config.im_end_id;
     turn2_count = append_text(&model, "\n", turn2, turn2_count);
@@ -89,7 +97,7 @@ int main(int argc, char **argv) {
     {
         /* Append only the reply1 tokens that were fed to the model; if a
          * pending token exists it is already the first entry of turn2. */
-        int fed_reply = reply1.count - (pending >= 0 ? 1 : 0);
+        int fed_reply = reply1.count - (pending1 >= 0 ? 1 : 0);
         for (i = 0; i < fed_reply; ++i) full[full_count++] = reply1.ids[i];
     }
     for (i = 0; i < turn2_count; ++i) full[full_count++] = turn2[i];

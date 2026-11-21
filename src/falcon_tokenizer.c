@@ -46,16 +46,24 @@ static int find_token(const FalconTokenizer *tokenizer,
     return -1;
 }
 
+/* Chunks up to this many bytes (every chunk a PSP prompt can produce)
+ * merge in static scratch, so tokenizing a turn never allocates; longer
+ * ones (host tools only) fall back to malloc. Single-threaded use. */
+#define BPE_STATIC_WORK 1024
+
 static int bpe_chunk(const FalconTokenizer *tokenizer,
                      const uint8_t *text, int length,
                      int *output, int capacity) {
-    int *work;
+    static int static_work[BPE_STATIC_WORK];
+    int *work = static_work;
     uint8_t combined[512];
     int count = length, i;
     if (length <= 0) return 0;
     if (length > capacity) return -1;
-    work = (int *)malloc((size_t)length * sizeof(int));
-    if (!work) return -1;
+    if (length > BPE_STATIC_WORK) {
+        work = (int *)malloc((size_t)length * sizeof(int));
+        if (!work) return -1;
+    }
     for (i = 0; i < length; ++i)
         work[i] = rd16(tokenizer->byte_ids + text[i] * 2);
     while (count > 1) {
@@ -88,7 +96,7 @@ static int bpe_chunk(const FalconTokenizer *tokenizer,
         --count;
     }
     memcpy(output, work, (size_t)count * sizeof(int));
-    free(work);
+    if (work != static_work) free(work);
     return count;
 }
 

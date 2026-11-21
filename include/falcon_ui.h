@@ -66,6 +66,12 @@ int falcon_ui_line_count(void);
 int falcon_ui_max_scroll(void);
 int falcon_ui_has_history(void);
 
+/* Keyboard layouts (llmpsp_config.cfg "keyboard"): alphabetical, or a
+ * PC-style QWERTY block with the symbols around it. Both hold the same
+ * 60 characters in the same 15x4 grid. */
+#define UI_LAYOUT_ABC    0
+#define UI_LAYOUT_QWERTY 1
+void falcon_ui_set_layout(int layout);
 const char *falcon_ui_keys(int upper);
 
 /* Top pixel row of a grid row. Rows are 8 pixels tall and spaced with

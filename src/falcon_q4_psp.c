@@ -1,149 +1,38 @@
-/* PSP-only VFPU kernels: Q4 row dot product, int8 attention, and the
- * Mamba state update.
+/* PSP-only VFPU kernels: the four-row Q4 tile matvec kernel, int8
+ * attention, and the Mamba state update.
  *
  * Shared conventions:
  * - vc2i.s expands 4 signed bytes of one word into 4 ints (value << 24)
  *   with byte 0 (LSB) in lane 0; vi2f.q with scale 24 turns them into
  *   the plain byte values as floats. Validated end to end in PPSSPP.
- * - All float buffers handed to lv.q are 16-byte aligned (alloc_array
- *   in falcon_h1.c guarantees this for runtime arrays; int8 KV rows are
- *   64 bytes at 64-byte strides from aligned bases).
+ * - Everything handed to lv.q/sv.q is 16-byte aligned (alloc_array in
+ *   falcon_h1.c guarantees this for runtime arrays; tile groups are
+ *   aligned by the FHQ4 version-2 layout and the aligned cache blocks
+ *   and buffers; int8 KV rows are 64 bytes at 64-byte strides from
+ *   aligned bases). Real hardware faults otherwise; PPSSPP does not.
  * - Everything runs on the single inference thread; static scratch is
  *   fine. Results are not bit-identical to the scalar host kernels
  *   (summation order), verified end to end against the host build.
  *
- * The Q4 kernel converts each block's fp16 scale with integer ops
- * inline (sign/exponent/mantissa relocation). Denormal fp16 scales are
- * flushed to zero: the shipped model has 5 of them among 2.8 million
- * scales, and a denormal scale (< 6.1e-5) makes every weight in its
- * block numerically irrelevant anyway. Zero scales convert exactly. */
+ * The Q4 kernels decode each block's four 8-bit scale codes with exact
+ * integer-valued float operations only (falcon_q4_tile_psp.h), so the
+ * decoded scales are bit-identical on hardware, in PPSSPP and on the host
+ * (scale_code_value in falcon_h1.c). No denormal scale can occur: the
+ * loader rejects code parameters whose magnitudes are not normal. */
 #include "falcon_h1.h"
 
 #if defined(_PSP_FW_VERSION) && !defined(FALCON_SCALAR_ONLY)
 
-float falcon_dot_q4_vfpu(const uint8_t *row, const float *x,
-                         int blocks, const float *block_sums) {
-    static uint32_t scratch[12] __attribute__((aligned(16)));
-    float result;
-    const uint8_t *r = row;
-    const float *xp = x;
-    const float *bp = block_sums;
-    int n = blocks;
-    __asm__ volatile (
-        ".set push\n"
-        ".set reorder\n"
-        ".set macro\n"
-        "vzero.q C000\n"            /* row accumulator (d-scaled dots) */
-        "vzero.s S010\n"            /* sum of d_b * block_sum_b */
-        "lui   $24, 0x0F0F\n"
-        "ori   $24, $24, 0x0F0F\n"
-        "1:\n"
-        "ulw   $8, 2(%[row])\n"     /* packed bytes 0-3 */
-        "ulw   $9, 6(%[row])\n"
-        "ulw   $10, 10(%[row])\n"
-        "ulw   $11, 14(%[row])\n"
-        "and   $12, $8, $24\n"      /* low nibbles: weights 0-15 */
-        "srl   $8, $8, 4\n"
-        "and   $8, $8, $24\n"       /* high nibbles: weights 16-31 */
-        "and   $13, $9, $24\n"
-        "srl   $9, $9, 4\n"
-        "and   $9, $9, $24\n"
-        "and   $14, $10, $24\n"
-        "srl   $10, $10, 4\n"
-        "and   $10, $10, $24\n"
-        "and   $15, $11, $24\n"
-        "srl   $11, $11, 4\n"
-        "and   $11, $11, $24\n"
-        "sw    $12, 0(%[sc])\n"
-        "sw    $13, 4(%[sc])\n"
-        "sw    $14, 8(%[sc])\n"
-        "sw    $15, 12(%[sc])\n"
-        "sw    $8, 16(%[sc])\n"
-        "sw    $9, 20(%[sc])\n"
-        "sw    $10, 24(%[sc])\n"
-        "sw    $11, 28(%[sc])\n"
-        /* fp16 block scale -> f32 bits with integer ops. Denormals
-         * (exponent field 0) flush to zero, inf/nan never occur. */
-        "lhu   $25, 0(%[row])\n"
-        "andi  $2, $25, 0x3FF\n"
-        "sll   $2, $2, 13\n"        /* mantissa << 13 */
-        "srl   $3, $25, 10\n"
-        "andi  $3, $3, 0x1F\n"
-        "addiu $3, $3, 112\n"
-        "sll   $3, $3, 23\n"        /* (e + 112) << 23 */
-        "addu  $2, $2, $3\n"        /* disjoint bit fields */
-        "srl   $3, $25, 15\n"
-        "sll   $3, $3, 31\n"        /* sign */
-        "or    $2, $2, $3\n"
-        "andi  $3, $25, 0x7C00\n"
-        "sltu  $3, $0, $3\n"        /* 1 when exponent != 0 */
-        "negu  $3, $3\n"
-        "and   $2, $2, $3\n"
-        "sw    $2, 32(%[sc])\n"
-        "lv.s  S030, 32(%[sc])\n"   /* d for this block */
-        "lv.s  S031, 0(%[bs])\n"    /* block sum of x */
-        "lv.q  C100, 0(%[sc])\n"    /* nibble bytes, weights 0-15 */
-        "lv.q  C110, 16(%[sc])\n"   /* nibble bytes, weights 16-31 */
-        "vc2i.s C200, S100\n"       /* 4 signed bytes -> 4 ints << 24 */
-        "vc2i.s C210, S101\n"
-        "vc2i.s C220, S102\n"
-        "vc2i.s C230, S103\n"
-        "vc2i.s C300, S110\n"
-        "vc2i.s C310, S111\n"
-        "vc2i.s C320, S112\n"
-        "vc2i.s C330, S113\n"
-        "vi2f.q C200, C200, 24\n"   /* ints -> float nibble values 0..15 */
-        "vi2f.q C210, C210, 24\n"
-        "vi2f.q C220, C220, 24\n"
-        "vi2f.q C230, C230, 24\n"
-        "vi2f.q C300, C300, 24\n"
-        "vi2f.q C310, C310, 24\n"
-        "vi2f.q C320, C320, 24\n"
-        "vi2f.q C330, C330, 24\n"
-        "lv.q  C400, 0(%[x])\n"
-        "lv.q  C410, 16(%[x])\n"
-        "lv.q  C420, 32(%[x])\n"
-        "lv.q  C430, 48(%[x])\n"
-        "lv.q  C500, 64(%[x])\n"
-        "lv.q  C510, 80(%[x])\n"
-        "lv.q  C520, 96(%[x])\n"
-        "lv.q  C530, 112(%[x])\n"
-        "vmul.q C600, C200, C400\n"
-        "vmul.q C610, C210, C410\n"
-        "vmul.q C620, C220, C420\n"
-        "vmul.q C630, C230, C430\n"
-        "vmul.q C700, C300, C500\n"
-        "vmul.q C710, C310, C510\n"
-        "vmul.q C720, C320, C520\n"
-        "vmul.q C730, C330, C530\n"
-        "vadd.q C600, C600, C610\n"
-        "vadd.q C620, C620, C630\n"
-        "vadd.q C700, C700, C710\n"
-        "vadd.q C720, C720, C730\n"
-        "vadd.q C600, C600, C620\n"
-        "vadd.q C700, C700, C720\n"
-        "vadd.q C600, C600, C700\n" /* raw block dot in 4 lanes */
-        "vscl.q C600, C600, S030\n" /* scale by d */
-        "vadd.q C000, C000, C600\n"
-        "vmul.s S032, S030, S031\n" /* d * block_sum */
-        "vadd.s S010, S010, S032\n"
-        "addiu %[row], %[row], 18\n"
-        "addiu %[x], %[x], 128\n"
-        "addiu %[bs], %[bs], 4\n"
-        "addiu %[n], %[n], -1\n"
-        "bnez  %[n], 1b\n"
-        "vfad.q S020, C000\n"       /* horizontal sum of the 4 lanes */
-        "vfim.s S021, 8.0\n"
-        "vmul.s S022, S010, S021\n"
-        "vsub.s S020, S020, S022\n"
-        "sv.s  S020, 0(%[out])\n"
-        ".set pop\n"
-        : [row] "+r"(r), [x] "+r"(xp), [bs] "+r"(bp), [n] "+r"(n)
-        : [sc] "r"(scratch), [out] "r"(&result)
-        : "$2", "$3", "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15",
-          "$24", "$25", "memory");
-    return result;
-}
+#include "falcon_q4_tile_psp.h"
+
+/* group: one tile group (16-byte aligned); xt: per block 4 x {x16 quad,
+ * xd quad}; block_sums: per block the sum of x over its 16 low-nibble
+ * columns; out: four results (16-byte aligned); blocks a multiple of 4;
+ * bias: four copies of k * 2^(23 - m). One kernel per scale-code mantissa
+ * width m (the vi2f immediate is m + 1). */
+DEFINE_TILE_KERNEL(falcon_q4_tile4_m3, 4)
+DEFINE_TILE_KERNEL(falcon_q4_tile4_m4, 5)
+DEFINE_TILE_KERNEL(falcon_q4_tile4_m5, 6)
 
 /* Raw int8 attention score dots: scores[t] = sum(q[i] * key_t[i]) for
  * t in [0, count). keys advances by stride bytes per step; the caller
@@ -464,6 +353,151 @@ void falcon_vfpu_mamba_head(float *state, const float *hidden,
         ".set pop\n"
         : [st] "+r"(st), [h] "+r"(h), [a] "+r"(a), [n] "+r"(n)
         : [b] "r"(b), [cc] "r"(cc), [dd] "r"(decay_dt)
+        : "memory");
+}
+
+/* The same update with the state stored as float16 (FALCON_STATE_F16,
+ * PROJECT.md section 2.10): 64 halves = 128 bytes per channel. The new
+ * value of each element (kept in float for the dot with cc) is clamped to
+ * +-65504, rounded to 11 significant bits with exact arithmetic (Veltkamp:
+ * c = x * 8193, hi = c - (c - x)) and flushed to zero below 2^-14 before
+ * vf2h, so vf2h converts exactly and hardware (which truncates and
+ * flushes) and PPSSPP (which rounds and keeps denormals) store the same
+ * bits; state_store() in falcon_h1.c is the host model of exactly this.
+ * Constants: C100 = +65504, C110 = -65504, C120 = 2^-14, C130 = 0 (all
+ * four lanes), S030 = 8193. state 16-byte aligned (channel stride 128). */
+static const float f16_consts[20] __attribute__((aligned(16))) = {
+    65504.0f, 65504.0f, 65504.0f, 65504.0f,
+    -65504.0f, -65504.0f, -65504.0f, -65504.0f,
+    6.103515625e-05f, 6.103515625e-05f, 6.103515625e-05f, 6.103515625e-05f,
+    0.0f, 0.0f, 0.0f, 0.0f,
+    8193.0f, 0.0f, 0.0f, 0.0f,
+};
+
+void falcon_vfpu_mamba_head_f16(uint16_t *state, const float *hidden,
+                                const float *b, const float *cc,
+                                const float *decay_dt, float *acc) {
+    uint16_t *st = state;
+    const float *h = hidden;
+    float *a = acc;
+    int n = 32;
+    __asm__ volatile (
+        ".set push\n"
+        ".set reorder\n"
+        ".set macro\n"
+        "lv.s  S010, 0(%[dd])\n"    /* decay */
+        "lv.s  S011, 4(%[dd])\n"    /* dt */
+        "lv.q  C100, 0(%[k])\n"     /* clamp, flush and Veltkamp constants */
+        "lv.q  C110, 16(%[k])\n"
+        "lv.q  C120, 32(%[k])\n"
+        "lv.q  C130, 48(%[k])\n"
+        "lv.s  S030, 64(%[k])\n"
+        "lv.q  C400, 0(%[b])\n"     /* b resident in M400-M730 */
+        "lv.q  C410, 16(%[b])\n"
+        "lv.q  C420, 32(%[b])\n"
+        "lv.q  C430, 48(%[b])\n"
+        "lv.q  C500, 64(%[b])\n"
+        "lv.q  C510, 80(%[b])\n"
+        "lv.q  C520, 96(%[b])\n"
+        "lv.q  C530, 112(%[b])\n"
+        "lv.q  C600, 128(%[b])\n"
+        "lv.q  C610, 144(%[b])\n"
+        "lv.q  C620, 160(%[b])\n"
+        "lv.q  C630, 176(%[b])\n"
+        "lv.q  C700, 192(%[b])\n"
+        "lv.q  C710, 208(%[b])\n"
+        "lv.q  C720, 224(%[b])\n"
+        "lv.q  C730, 240(%[b])\n"
+        "1:\n"
+        "lv.s  S012, 0(%[h])\n"
+        "vmul.s S013, S011, S012\n" /* coeff = dt * hidden */
+        "vzero.q C020\n"            /* channel accumulator */
+        /* 4 groups of 16 elements: 32 bytes of halves, the matching b
+         * block and 64 bytes of cc. */
+#define FALCON_MAMBA16_GROUP(HOFF, COFF, B0, B1, B2, B3)                  \
+        "lv.q  C300, " #HOFF "+0(%[st])\n"                               \
+        "lv.q  C310, " #HOFF "+16(%[st])\n"                              \
+        "vh2f.p C200, C300\n"                                            \
+        "vh2f.p C210, C302\n"                                            \
+        "vh2f.p C220, C310\n"                                            \
+        "vh2f.p C230, C312\n"                                            \
+        "vscl.q C200, C200, S010\n"                                      \
+        "vscl.q C210, C210, S010\n"                                      \
+        "vscl.q C220, C220, S010\n"                                      \
+        "vscl.q C230, C230, S010\n"                                      \
+        "vscl.q C300, " B0 ", S013\n"                                    \
+        "vscl.q C310, " B1 ", S013\n"                                    \
+        "vscl.q C320, " B2 ", S013\n"                                    \
+        "vscl.q C330, " B3 ", S013\n"                                    \
+        "vadd.q C200, C200, C300\n"                                      \
+        "vadd.q C210, C210, C310\n"                                      \
+        "vadd.q C220, C220, C320\n"                                      \
+        "vadd.q C230, C230, C330\n"                                      \
+        "lv.q  C300, " #COFF "+0(%[cc])\n"                               \
+        "lv.q  C310, " #COFF "+16(%[cc])\n"                              \
+        "lv.q  C320, " #COFF "+32(%[cc])\n"                              \
+        "lv.q  C330, " #COFF "+48(%[cc])\n"                              \
+        "vmul.q C300, C200, C300\n"                                      \
+        "vmul.q C310, C210, C310\n"                                      \
+        "vmul.q C320, C220, C320\n"                                      \
+        "vmul.q C330, C230, C330\n"                                      \
+        "vadd.q C300, C300, C310\n"                                      \
+        "vadd.q C320, C320, C330\n"                                      \
+        "vadd.q C300, C300, C320\n"                                      \
+        "vadd.q C020, C020, C300\n"                                      \
+        "vmin.q C200, C200, C100\n"       /* clamp to +-65504 */         \
+        "vmin.q C210, C210, C100\n"                                      \
+        "vmin.q C220, C220, C100\n"                                      \
+        "vmin.q C230, C230, C100\n"                                      \
+        "vmax.q C200, C200, C110\n"                                      \
+        "vmax.q C210, C210, C110\n"                                      \
+        "vmax.q C220, C220, C110\n"                                      \
+        "vmax.q C230, C230, C110\n"                                      \
+        "vscl.q C300, C200, S030\n"       /* c = x * 8193 */             \
+        "vscl.q C310, C210, S030\n"                                      \
+        "vscl.q C320, C220, S030\n"                                      \
+        "vscl.q C330, C230, S030\n"                                      \
+        "vsub.q C200, C300, C200\n"       /* t = c - x */                \
+        "vsub.q C210, C310, C210\n"                                      \
+        "vsub.q C220, C320, C220\n"                                      \
+        "vsub.q C230, C330, C230\n"                                      \
+        "vsub.q C200, C300, C200\n"       /* hi = c - t */               \
+        "vsub.q C210, C310, C210\n"                                      \
+        "vsub.q C220, C320, C220\n"                                      \
+        "vsub.q C230, C330, C230\n"                                      \
+        "vabs.q C300, C200\n"             /* flush below 2^-14 */        \
+        "vabs.q C310, C210\n"                                            \
+        "vabs.q C320, C220\n"                                            \
+        "vabs.q C330, C230\n"                                            \
+        "vcmp.q LT, C300, C120\n"                                        \
+        "vcmovt.q C200, C130, 6\n"                                       \
+        "vcmp.q LT, C310, C120\n"                                        \
+        "vcmovt.q C210, C130, 6\n"                                       \
+        "vcmp.q LT, C320, C120\n"                                        \
+        "vcmovt.q C220, C130, 6\n"                                       \
+        "vcmp.q LT, C330, C120\n"                                        \
+        "vcmovt.q C230, C130, 6\n"                                       \
+        "vf2h.q C300, C200\n"                                            \
+        "vf2h.q C302, C210\n"                                            \
+        "vf2h.q C310, C220\n"                                            \
+        "vf2h.q C312, C230\n"                                            \
+        "sv.q  C300, " #HOFF "+0(%[st])\n"                               \
+        "sv.q  C310, " #HOFF "+16(%[st])\n"
+        FALCON_MAMBA16_GROUP(0,  0,   "C400", "C410", "C420", "C430")
+        FALCON_MAMBA16_GROUP(32, 64,  "C500", "C510", "C520", "C530")
+        FALCON_MAMBA16_GROUP(64, 128, "C600", "C610", "C620", "C630")
+        FALCON_MAMBA16_GROUP(96, 192, "C700", "C710", "C720", "C730")
+#undef FALCON_MAMBA16_GROUP
+        "vfad.q S001, C020\n"
+        "sv.s  S001, 0(%[a])\n"
+        "addiu %[st], %[st], 128\n"
+        "addiu %[h], %[h], 4\n"
+        "addiu %[a], %[a], 4\n"
+        "addiu %[n], %[n], -1\n"
+        "bnez  %[n], 1b\n"
+        ".set pop\n"
+        : [st] "+r"(st), [h] "+r"(h), [a] "+r"(a), [n] "+r"(n)
+        : [b] "r"(b), [cc] "r"(cc), [dd] "r"(decay_dt), [k] "r"(f16_consts)
         : "memory");
 }
 

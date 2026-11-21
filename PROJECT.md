@@ -26,11 +26,25 @@ v1.6 build and public v1.1 to internal v1.11; the internal version
 numbers in sections 2.1-2.7 are kept because they document the
 hardware-only bugs and the performance measurements in order.
 
+Version v1.3 (git tag v1.3, packaged in release/LLMPSP-v1.3) is the build
+of section 2.9: FHQ4 version 2, the four-row vtfm4 kernel, raw card
+reads and context 384. Measured on a PSP-2000 at 333 MHz: about 850 ms
+per prompt token and 935 ms per reply token (~1.07 tokens/second, from
+~0.56), with 4.6 MiB still streamed per token. Its weights are bit-for-
+bit those of the original conversion, so it is the reference to fall
+back to if a later size or speed change costs quality. The build after
+it (section 2.10, version string still v1.3) is the first that changes
+numerics: FHQ4 version 3 with 8-bit scale codes, a float16 Mamba state
+and the context fit policy, to hold the whole model in RAM.
+
 ## 2. Current status
 
 The following are verified:
 
-- The official checkpoint converts to a 52,244,480-byte FHQ4 file.
+- The shipped model is a 49,402,560-byte FHQ4 file (format version 3
+  since section 2.10, re-packed from the 52,244,480-byte version-2
+  conversion with tools/repack_fhq4.py; the converter writes version 3
+  directly but could not be run end to end without the checkpoint).
 - The portable C code compiles with warnings treated as errors.
 - Tokenizer and chat-template regression vectors match the official tokenizer.
 - End-to-end greedy generation works on the host runtime.
@@ -307,6 +321,358 @@ kernels and streaming fewer bytes (context = 256). A speculative future
 option is storing the Mamba recurrent state as float16 (frees 2.25 MiB
 for cache) at some quality risk.
 
+### 2.8 Post-v1.11 research and the benchmark EBOOT
+
+Nothing in the app changed in this step. A research pass (2026-11)
+looked for what is left beyond ~0.55 tokens/second and produced a
+benchmark that measures the open questions on real hardware.
+
+Where a reply token goes at context 256 (v1.11, PSP-2000, ~1.78 s):
+layer matvecs ~850 ms, card streaming ~600 ms (3.9 MiB), output head
+~250 ms, everything else ~82 ms. Two levers follow from that.
+
+1. A faster Q4 kernel. The VFPU issues one instruction per cycle
+   (documented timings: vmul/vadd/vi2f/vf2id throughput 1, latency 5;
+   vc2i latency 3; vtfm4.q throughput 4, latency 10), so cost is
+   instruction count, and the shipped kernel spends about 96
+   instructions per 32 weights, a third of them unpacking nibbles with
+   integer ops through a scratch buffer. tools/q4_tile_psp.c splits the
+   nibbles inside the VFPU (signed byte / 16, then floor, is the high
+   nibble) and handles four rows per pass with vtfm4.q: 105 instructions
+   per 128 weights. It needs a "tile" layout (four rows interleaved,
+   high nibble as two's complement, scales grouped per four rows) that
+   is a lossless rearrangement of FHQ4 at the same 18 bytes per 32
+   weights; the header comment of that file is the format reference.
+   By the timing model that is ~1 cycle per weight against ~3.8 now.
+   What the model cannot say is how much of a token is RAM bandwidth:
+   every token scans ~49 MiB of weights, far more than the 16 KiB data
+   cache.
+2. No card streaming. ARK gives the user partition 51 MiB (56 minus the
+   4 MiB partition 11 and 1 MiB partition 8), which matches the ~40 MiB
+   cache ceiling seen on hardware, so more RAM is not available. The
+   model is short by ~5.7 MiB at context 512 and ~3.9 MiB at 256, and
+   each streamed MiB costs about 155 ms per token. Candidate savings:
+   8-bit log-scale block scales instead of fp16 (2.7 MiB; measured scale
+   error ~1% mean, 2.6% worst case with one range per matrix, far below
+   the 4-bit weight noise), the Mamba state as float16 through
+   vh2f/vf2h (2.25 MiB), and whatever PSP_HEAP_SIZE_KB(-2048) leaves
+   unused outside the heap.
+
+Measured and ruled out: dropping non-ASCII vocabulary (only 1,285 of
+32,768 tokens; 0.35 MiB) and entropy-coding the nibbles (3.3 to 3.8
+bits each, and decoding would cost more than the matvec). Also noted:
+the greedy sampler scans 64 history ids for each of the 32,768 logits
+(~30 ms per reply token); an overclock beyond 333 MHz exists as a CFW
+plugin and in ARK-5 but is experimental and per-unit; the Media Engine
+core has no VFPU and needs a kernel module, so it is not worth pursuing
+before the items above.
+
+The benchmark (tools/bench_psp.c, EBOOT "LLMPSP Bench") settles the
+unknowns. Build it with
+
+    tools/bench_build.sh
+
+inside the PSPDEV environment. It compiles in build/bench (so the app's
+EBOOT.PBP in the repository root is never overwritten), stages
+build/LLMPSPBench, and runs the EBOOT once in PPSSPP headless when that
+is installed. The emulator run only proves correctness: every kernel
+must report PASS against the scalar reference. Emulator timings mean
+nothing.
+
+On the console: copy build/LLMPSPBench to ms0:/PSP/GAME/, run it with
+the normal LLMPSP folder (model.fhq4) in place, wait about 15 seconds,
+and read ms0:/PSP/GAME/LLMPSPBench/bench_log.txt on a PC.
+
+| Log line | What it decides |
+| --- | --- |
+| [kernel] shipped / vtfm4 / vdot | Cycles per weight streaming from RAM and with the data cache warm. vtfm4 at half the shipped figure or better from RAM justifies the tile format; "cached" far below "RAM" means memory bandwidth is the limit |
+| [ram] | Cost of one 64-byte line that misses the data cache; times ~800,000 lines per token it is the floor no kernel can beat |
+| [project] | Matvec milliseconds per reply token for both kernels if every weight were in RAM |
+| [mem] | Free RAM outside the heap (reclaimable by shrinking the heap reserve) and the heap's size in cache blocks |
+| [card] | Raw sceIoRead against the app's stdio path, with aligned and unaligned offsets; only matters while anything still streams |
+| [probe] | vf2id nibble split must PASS; the vh2f/vf2h lines show how hardware treats denormals and rounding, for the float16 Mamba state |
+| [clock] | A pure integer loop: confirms the real clock, and shows the gain when an overclock is active |
+
+### 2.9 Tile-format Q4 kernel, raw card reads, sampler, context back-off
+
+Acting on the section 2.8 benchmark (PSP-2000): the version-1 row kernel
+cost 4.83 cycles per weight, the four-row vtfm4 kernel 1.75 (2.76x), all
+correctness checks passing on hardware; card reads through the app's
+stdio path ran at 10.3 MiB/s against 16.2 MiB/s for raw sceIoRead of
+256 KiB into a 64-byte aligned buffer at a 512-aligned file offset (32 KiB
+reads 14.9; file offset +100 13.6; buffer +4 14.8); the greedy sampler
+spent ~30 ms per reply token.
+
+1. FHQ4 version 2 (section 8.1). Every Q4 matrix is stored as tile
+   groups of four rows, a lossless rearrangement at the same 18 bytes
+   per 32 weights. tools/convert_falcon_h1.py writes version 2;
+   tools/repack_fhq4.py converts a version-1 file without the BF16
+   checkpoint and proves the result lossless by decoding both files to
+   (scale, nibble) arrays with independent code (217 matrices, 90,996,736
+   weights, 2,843,648 scales identical; float tensors, tokenizer and
+   header identical apart from the version field). The loader rejects
+   version 1 with a message naming the re-pack tool, and rejects any Q4
+   matrix whose row count is not a multiple of 4, whose column count is
+   not a multiple of 64, or whose offset in the weight region is not a
+   multiple of 16. (Section 2.10 replaced version 2 by version 3: the
+   loader now rejects versions 1 and 2 and needs columns % 128.)
+2. PSP matvecs use falcon_q4_tile4_vtfm (src/falcon_q4_psp.c, macros
+   and format reference in src/falcon_q4_tile_psp.h; since 2.10 the
+   version-3 kernels falcon_q4_tile4_m3/m4/m5 there, and this version-2
+   kernel lives on in tools/q4_tile_v2_psp.h for the benchmark only). q4_matvec builds
+   the activation tables (16 x_lo and x_hi - 16 x_lo per tile, plus the
+   low-nibble block sums) once per matvec and processes four rows per
+   kernel call. Host builds keep a scalar golden kernel that reads the
+   tile layout with exactly the version-1 per-row arithmetic and
+   summation order, so host outputs are byte-identical to version 1.
+   The version-1 row kernel moved to tools/q4_row_psp.c, used only by
+   the benchmark.
+3. Alignment, the main hardware risk: lv.q/sv.q raise an address error
+   on the real PSP for addresses that are not 16-byte aligned, and
+   PPSSPP does not emulate that fault. Guarantees: Q4 offsets are
+   16-aligned in the weight region (asserted by converter and loader)
+   and the region itself is 64-aligned; heap cache blocks are allocated
+   16-aligned (newlib's malloc only promises 8); groups that straddle a
+   256 KiB cache block go through the 16-aligned row buffer; the raw
+   read window is 64-aligned and starts at 512-aligned file offsets;
+   runtime arrays (the outputs) are 16-aligned and rows are multiples
+   of 4. A runtime guard copies any misaligned group before the kernel
+   runs and counts it in runtime.realigned_groups; the autotest logs it
+   ("[check] realigned groups 0") and the app's [perf] trace line ends
+   with "realigned N". It must stay 0. (The guard cannot see the tiles,
+   which start blocks * 8 bytes into a group, blocks * 4 since version 3;
+   the block-count check at load, even then and a multiple of 4 now,
+   covers them. A unit-test group with 3 blocks hung PPSSPP, so
+   the emulator is not entirely blind to misaligned quads, but it cannot
+   be relied on.) Denormal fp16 scales: the VFPU docs say vh2f flushes
+   them to zero, PPSSPP keeps them; the model has 5 among 2.8 million and
+   either result is numerically irrelevant. (Version 3 has no fp16
+   scales; its codes decode to normal floats only.)
+4. Raw streaming (PSP). Uncached groups are served from a 128 KiB,
+   64-byte aligned read window filled with one sceIoRead at a 512-aligned
+   offset, up to the window size or the next cached block. A group
+   straddling the window end keeps the sectors already read (moved to
+   the front), so no byte is read twice and every read stays aligned.
+   stdio then runs unbuffered (header, tokenizer, small tensors, the
+   256 KiB cache-fill reads and embedding groups are each one direct
+   read), so the 64 KiB stdio buffer is gone. If the raw descriptor or
+   window cannot be allocated, the app falls back to the version-1 stdio
+   path. Any read error still sets io_error and fails the turn cleanly.
+   RAM: the window costs 128 KiB + 64 B and the row buffer shrank from
+   32 KiB to 2 KiB when the window is active; minus the 64 KiB stdio
+   buffer that is a net +34 KiB, about 0.13 of a cache block. Why
+   128 KiB: by the measured rates 256 KiB reads save ~2 ms per streamed
+   MiB over 128 KiB but cost 128 KiB of cache (~12 ms per token at
+   ~100 ms per streamed MiB); 64 KiB saves 64 KiB of cache (~6 ms) but
+   reads ~2-3% slower. FALCON_STREAM_BYTES in src/falcon_h1.c is the
+   knob. [perf] streamed now counts bytes actually read from the card;
+   the window also carries the ~22 KiB of preloaded float tensors per
+   streamed layer (about 1% of a layer). Since 2.10 the descriptor is
+   opened with the model but the window is allocated only after the
+   cache fill, and only if blocks are left uncached
+   (falcon_model_stream_prepare; if the heap is full it gives one cached
+   block back first). The row buffer is 2 KiB whenever the raw
+   descriptor is open.
+5. Sampler. The repetition penalty marks the last 64 history ids in a
+   bitmap once per call, so the greedy and top-k scans cost
+   O(vocab + history) instead of O(vocab x 64). The scan loops are
+   unchanged, so the chosen token is identical in every case;
+   tools/sampler_test.c checks 12,000 random cases (ties, repeated and
+   out-of-range ids, top-k/top-p with identical RNG state) against the
+   previous implementation.
+6. Context default 384 (was 512; range still 128-512, the FHQ4 header
+   keeps 512 as the maximum). Startup backs off instead of refusing to
+   start: falcon_runtime_init_fit tries the configured context, then
+   16 tokens less at a time down to 128, and keeps the largest that
+   fits; the trace logs "[stage] context requested N, granted M". The
+   context meter, max_new, the "conversation is full" check and the
+   "too long for the N-token space" message all use the granted value.
+   Only if 128 does not fit does the fatal memory screen appear.
+   Generation never allocates: the repetition-penalty history is
+   allocated with the runtime for the whole context, and the tokenizer
+   merges chunks in static scratch (chunks over 1024 bytes, which the
+   768-byte PSP prompt cannot produce, still use malloc and fail as a
+   clean "too long" if it fails). tools/context_backoff_test.c checks
+   the grants under capped allocations (test hook
+   falcon_runtime_set_alloc_limit) and runs a chat at a backed-off
+   context of 224 until it is full; the autotest's
+   autotest_free_kb.txt fills the heap to exercise the back-off in
+   PPSSPP.
+
+Verified (host): every regression reply byte-identical to version 1 at
+cache 0, 32 and striped 20 (four prompts, 40 tokens); host_check.sh
+passes (tokenizer, multiturn, cache and striped equivalence, sampler,
+back-off, fpflag probe with no OVERFLOW/INVALID/DIVBYZERO). PPSSPP: the
+"hi" autotest replies "Hello! How can I help you today" with the default
+cache, cache 0, prefetch on, interpreter and JIT (version 1 gave
+"Hello! It's nice to hear": the summation order changed, section 2.7),
+with 0 realigned groups. Needs hardware: the speed gain (kernel and
+card), and the alignment guarantees, which only a real PSP can fault on.
+
+### 2.10 Whole model in RAM: 8-bit scale codes, float16 state, fit policy
+
+Goal: on the reference PSP-2000 the whole weight region sits in RAM at
+context 384, so no weight byte is streamed during generation (streaming
+cost ~360 ms of a 935 ms reply token in v1.3). Unlike every earlier step
+this one changes numerics; v1.3 (release/LLMPSP-v1.3, FHQ4 version 2,
+build/model_v2.fhq4) stays the reference.
+
+Budget (the user's v1.3 trace on a PSP-2000): the heap holds 199 blocks of
+256 KiB at boot, the volatile partition adds 16, the runtime took
+7555 KiB at context 384, and the cache got 179 blocks (16 + 163) of the
+198 the version-2 region needs, so 19 blocks (4.57 MiB) streamed per
+token. The changes, in blocks of 256 KiB:
+
+| Change | Saves |
+| --- | ---: |
+| 8-bit block-scale codes (FHQ4 version 3): region 51,723,008 -> 48,879,360 bytes, 198 -> 187 blocks | 11 blocks |
+| Mamba recurrent state as float16 (24 x 768 x 64): runtime 7555 -> 5251 KiB | 9 blocks |
+| Raw read window (128 KiB) allocated only if anything streams | 0.5 block |
+| Last cache block allocated at its real size (117.75 KiB) | 0.5 block |
+
+Resulting budget at context 384 (fit on, float16 state): 199 heap
+blocks minus tokenizer and small tensors (1034 KiB, 4.0 blocks) and the
+runtime (5251 KiB, 20.5 blocks) leaves ~174.4 blocks for the 170.5 heap
+blocks the cache needs (171 allocations, the last one partial) on top of
+the 16 volatile ones: about 3.9 blocks (~1 MiB) to spare. PPSSPP with the
+autotest's budget ballast (heap capped to exactly 199 blocks at boot,
+4 MiB volatile) confirms it: 187 blocks cached (16 + 171), 0 uncached,
+"streamed 0 KiB", 3 blocks of heap left. With the float32 state the same
+run reproduces the hardware trace to the KiB (runtime 7555 KiB, 45824
+KiB in 179 blocks). PSP_HEAP_SIZE_KB(-2048) is unchanged: the budget
+does not need the ~744 KiB outside the heap, and taking it would need a
+hardware test (thread stacks and kernel objects come out of it).
+
+1. FHQ4 version 3: one signed 8-bit code per 32-weight block instead of
+   the fp16 scale (17 bytes per 32 weights). Code c means 0 for c == 0,
+   otherwise sign(c) * float_from_bits((|c| + k) << (23 - m)): a
+   minifloat with m mantissa bits (3, 4 or 5) placed by a per-matrix
+   bias k. The 217 (m, k) pairs live in an 8-byte-per-matrix table
+   between the tokenizer and the weight region (section 8.2). Group
+   layout in section 8.1; blocks per row must now be a multiple of 4
+   (cols % 128 == 0, true for 512 and 768) so the tiles (blocks * 4 bytes
+   into the group) and the 68 * blocks byte groups stay 16-byte aligned;
+   converter, re-pack tool and loader check it, plus 16-aligned matrix
+   offsets as before. The loader rejects versions 1 and 2 with a message
+   naming tools/repack_fhq4.py, and rejects (m, k) for which any code
+   would decode to a non-normal float.
+   Why a minifloat and not a log code: decoding must be bit-identical on
+   host and PSP and cheap in the kernel. The VFPU has no table lookup and
+   only approximate exp2, but a float's bit pattern is its own
+   exponential: vc2i/vi2f/vabs/vadd/vf2iz build (|c| + k) << (23 - m) as
+   an integer-valued float, which is exact, and vsgn/vmul apply the sign
+   (src/falcon_q4_tile_psp.h). scale_code_value() in falcon_h1.c builds
+   the same bits with integer ops; the VFPU unit test checks all 256
+   codes for every m bit for bit.
+   Choosing codes: per matrix, tools/repack_fhq4.py (and the converter)
+   picks (m, k) minimising the added weight-error energy sum(sum(q^2) *
+   (d' - d)^2) and stores each scale's nearest code. Measured on the
+   shipped model: mean scale error 0.96%, 99th percentile 2.9% (embedding
+   and w_up/wv mostly m = 5: 0.6% mean); 199 blocks (of 2.8 million) are
+   zeroed and some more clipped at the bottom of their matrix's range
+   (186 in the worst matrix, layer7.mamba_out), where the error energy
+   is negligible. The added weight-error
+   energy is 0.5-2.2% of the Q4 rounding noise per matrix type.
+   tools/repack_fhq4.py converts version 2 (or 1, via 2) and always ends
+   with a check that decodes both files independently: nibbles and
+   float tensors identical, header and tokenizer identical apart from the
+   version, size, offset and table fields, decode rules consistent, no
+   sign flips; it prints the error statistics per matrix type and checks
+   that the converter's quantiser (q4_v3) reproduces the re-pack.
+2. Kernel cost: the scale path grew from 3 instructions per block (lv.s
+   x 2, vh2f.p) to 8 (lv.s, vc2i, vi2f, vabs, vsgn, vadd, vf2iz, vmul),
+   +5; the loop now runs two blocks per iteration, which saves 3 integer
+   instructions per block, so the kernel is 107 instructions per 128
+   weights instead of 105 (+2, ~+1.2% matvec time by the timing model).
+   There are three kernel instances (falcon_q4_tile4_m3/m4/m5; m is the
+   vi2f immediate) and q4_matvec picks one per matrix. Host builds keep
+   the scalar golden kernel (now with a per-matvec 256-entry decode
+   table); with FALCON_EVAL_V2 (tools/quality_eval.c only) it still reads
+   version 2 and is then bit-identical to v1.3.
+3. Float16 Mamba state (llmpsp_config.cfg state_f16, default 1; host
+   tools: STATE_F16=0 for float32). Measured first over long host
+   generations (17 conversations, prompt + 400 greedy tokens, every state
+   value of every token): max |s| 1679 (float16 max 65504; per layer
+   6.9 .. 1679), the bulk at 2^-12 .. 2^1, 0.89% of nonzero values below
+   the smallest normal float16 (2^-14) and 0.04% below 2^-24. So plain
+   float16 is safe in range; no per-layer scaling is needed.
+   Hardware vf2h truncates and flushes results below 2^-14, vh2f flushes
+   denormal halves, PPSSPP rounds and keeps denormals (the benchmark's
+   [probe] lines). The shipped mode does not let either decide: the new
+   value is clamped to +-65504 (so no infinity can ever be stored; the
+   measured maximum is 39x below it), rounded to 11 significant bits
+   with exact float arithmetic (Veltkamp: c = 8193 x, hi = c - (c - x)),
+   flushed to 0 below 2^-14 (vcmp/vcmovt), and only then converted, so
+   vf2h sees values it converts exactly and both store the same bits
+   (falcon_vfpu_mamba_head_f16; the unit test checks 6,144 values incl.
+   clamped and flushed ones bit for bit in PPSSPP). The dot with C uses
+   the unrounded value. state_store()/state_load() in falcon_h1.c are the
+   host model. Truncation (the raw hardware behaviour) and truncation
+   after x (1 + 2^-11) were measured too and are worse (table below);
+   they stay as host-only experiment modes. Cost: 68 instead of 32
+   instructions per 16 state elements (~2.65M more per token, ~8 ms at
+   333 MHz), against half the state traffic (2.25 instead of 4.5 MiB read
+   and written per token).
+4. Fit policy (llmpsp_config.cfg fit, default 1; falcon_fit_context).
+   After the cache fill, if blocks stayed on the card because the heap
+   ran out (not because of cache_mb), the runtime is re-initialised at
+   the largest context that lets every block be allocated with 16 KiB of
+   heap to spare, found by binary search at 1-token granularity (no
+   block is read until the final choice), but only within 25% of the
+   requested context and never below 128; otherwise the requested
+   context is restored and the remainder streams as before. The trace
+   logs "[stage] fit: context requested N, granted M (reason)". Nothing
+   allocates during generation. PPSSPP with the budget ballast: 199
+   blocks -> 384, all cached; 194 -> 383, all cached; 193 -> 325, all
+   cached; 192 and 190 -> 384, 5 and 7 blocks stream (they would need
+   more than 96 tokens); fit = 0 at 194 -> 384 with 4 blocks streaming.
+   tools/context_backoff_test.c checks the same on the host with a
+   modelled heap (falcon_set_heap_budget): exactly 379 when the budget
+   is five tokens short, streaming when 3 MiB short, identical tokens in
+   every case, for both state modes.
+5. Quality gate. tools/quality_eval.c teacher-forces the v1.3 reference
+   (v1.3 sources + version-2 model) through a candidate: 17
+   conversations (short chat, factual, instructions, arithmetic, code, a
+   multi-turn one, a 304-token passage), 64 greedy reply tokens each, 1353
+   compared positions (the last 16 prompt positions and the reply).
+   "greedy" is how many reply tokens free-running greedy decoding keeps
+   identical (average of 64), "kept" how many natural replies (up to the
+   reference's stop token) stay identical.
+
+| Candidate | top-1 | KL mean | KL max | greedy | kept |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Reference against itself (tool noise floor) | 100% | 7.0e-09 | 1.5e-07 | 64.0 | 17/17 |
+| Current code, version-2 model, float32 state | 100% | 7.0e-09 | 1.5e-07 | 64.0 | 17/17 |
+| Yardstick: v1.3 with four-lane block sums | 99.63% | 1.9e-04 | 1.1e-02 | 55.5 | 13/17 |
+| Float16 state only, shipped rounding | 98.23% | 1.2e-03 | 5.5e-02 | 32.1 | 4/17 |
+| Float16 state only, truncation (raw vf2h) | 98.00% | 2.2e-03 | 1.4e-01 | 32.8 | 4/17 |
+| Float16 state only, truncation of x(1+2^-11) | 97.93% | 1.3e-03 | 2.2e-01 | 30.7 | 4/17 |
+| 8-bit scale codes only | 95.49% | 1.8e-02 | 3.0e-01 | 18.1 | 1/17 |
+| Both (shipped) | 95.05% | 1.8e-02 | 2.5e-01 | 17.6 | 1/17 |
+
+   Scale codes of one matrix type at a time (version-2 files with the
+   decoded codes, build/eval/ablate.py): KL mean embedding 4.3e-3,
+   attention 8.7e-3, mamba_in 7.6e-3, mamba_out 4.7e-3, MLP 1.4e-2: the
+   cost is spread over every type, the price of ~1% scale error, not one
+   bad matrix. Replies stay coherent ("hi" -> "Hello! How can I help you
+   today?" on host and in PPSSPP), but they are no longer v1.3's.
+   Shipping only one change: the state is a config key (state_f16 = 0);
+   the scale format is a file format, so shipping the state alone means
+   the version-2 loader and v1.3 kernel again (and ~8 blocks stream).
+
+Verified: host_check.sh (both state modes: cache 0 = cached = striped,
+fpflag probe clean on two prompts, multiturn, back-off and fit);
+re-pack check; VFPU unit test (interpreter and JIT: all 256 codes exact
+for m = 3, 4, 5, kernels within 2.5e-5, float16 state bit-exact); the
+autotest in PPSSPP (JIT and interpreter, cache 44 and cache 0, plus the
+budget runs above) replies "Hello! How can I help you today" every time
+with 0 realigned groups. Needs hardware: the speed gain, the budget
+itself (199 blocks, streamed 0 KiB), the fit re-initialisation on
+newlib's real heap, the alignment of the new layout, and that the
+VFPU's vscl/vsub round to nearest like IEEE (the Veltkamp step relies on
+it; PPSSPP uses the host FPU) and vcmp/vcmovt/vsgn/vf2iz behave as in
+PPSSPP.
+
 ## 3. Quick start
 
 The runnable PSP files are kept at the repository root:
@@ -334,16 +700,21 @@ generated tokens.
 | --- | --- |
 | include/falcon_h1.h | Public model, runtime, tokenizer, sampler, and callback API |
 | src/falcon_h1.c | FHQ4 loader, cache, Q4 kernels, attention, Mamba, MLP, generation |
-| src/falcon_q4_psp.c | PSP-only VFPU kernel for the Q4 row dot product |
+| src/falcon_q4_psp.c | PSP-only VFPU kernels: four-row Q4 tile matvec (one per scale-code width), int8 attention, Mamba state (float32 and float16) |
+| src/falcon_q4_tile_psp.h | Version-3 tile-format and scale-code reference and the Q4 kernel macros |
 | src/falcon_prefetch_psp.c | PSP-only asynchronous weight-tail prefetcher |
-| llmpsp_config.cfg | User configuration (cache, clock, sampling, context) |
+| llmpsp_config.cfg | User configuration (cache, clock, sampling, context, fit, state_f16) |
 | tools/host_check.sh | Rebuilds and reruns the whole host regression suite |
 | src/falcon_tokenizer.c | Falcon byte-level BPE and instruct prompt construction |
 | src/falcon_sampler.c | Greedy, repetition penalty, top-k, and top-p sampling |
 | src/main_psp.c | PSP threads, power guard, trace, input, and generation flow |
 | src/falcon_ui.c | Transcript buffer, word wrap, and screen composition |
 | include/falcon_ui.h | Screen grid layout constants and UI state |
-| tools/convert_falcon_h1.py | Official-checkpoint downloader and FHQ4 converter |
+| tools/convert_falcon_h1.py | Official-checkpoint downloader and FHQ4 (version 3) converter |
+| tools/repack_fhq4.py | FHQ4 re-pack 1 -> 2 (lossless) and 2 -> 3 (8-bit scale codes) with a decode-and-compare check and scale error statistics |
+| tools/sampler_test.c | Host test: sampler picks the same token as the previous implementation |
+| tools/context_backoff_test.c | Host test: startup context back-off, a chat run to the granted limit, and the fit policy under a modelled heap |
+| tools/quality_eval.c | Host quality gate: teacher-forces the v1.3 reference through a candidate (top-1, KL, greedy agreement; section 2.10) |
 | tools/falcon_host_cli.c | Portable desktop inference test program |
 | tools/tokenizer_test.c | Exact tokenizer/chat-template regression vectors |
 | tools/fpflag_probe.c | Host FPU-flag probe that predicts on-device FPU crashes |
@@ -351,6 +722,12 @@ generated tokens.
 | tools/ui_preview.c | Renders the PSP screen grid on the host for layout work |
 | tools/main_psp_autotest.c | No-input on-device self-test frontend |
 | tools/Makefile.autotest | Builds the FalconAutoTest self-test EBOOT |
+| tools/bench_psp.c | On-device benchmark: RAM scan, version-1 row kernel ("shipped" in its log) vs tile kernel, card read, heap (section 2.8) |
+| tools/q4_tile_psp.c | The version-2 tile kernels (vtfm4 and the vdot cross-check); benchmark only |
+| tools/q4_tile_v2_psp.h | The v1.3 (FHQ4 version 2, fp16 scale) kernel macros, kept for the benchmark |
+| tools/q4_row_psp.c | The version-1 single-row VFPU kernel; benchmark only, not in the app |
+| tools/Makefile.bench | Builds the LLMPSP Bench EBOOT inside build/bench |
+| tools/bench_build.sh | Builds the benchmark and runs it once in PPSSPP headless |
 | tools/make_icon.py | Generates ICON0.PNG, the XMB thumbnail |
 | Makefile | PSPDEV EBOOT and package build |
 | EBOOT.PBP | Current PSP executable |
@@ -381,28 +758,34 @@ Measured or deterministic memory costs are approximately:
 
 | Item | Resident memory |
 | --- | ---: |
-| Recurrent/KV/scratch runtime | 8.19 MiB |
-| Tokenizer plus stdio buffer | 0.75 MiB |
-| Default cached weights (heap) | up to 44 MiB |
+| Recurrent/KV/scratch runtime | 5.13 MiB at context 384 with the float16 state (7.38 with float32; +6.4 KiB per token) |
+| Tokenizer and small float tensors (plus the 128 KiB raw read window only if anything streams) | 1.01 MiB |
+| Cached weights (heap), default target 44 MiB | 42.6 MiB for the whole model beyond the volatile part |
 | Volatile-partition cache extension | 4 MiB when granted |
 | EBOOT payload | about 0.24 MiB |
-| FHQ4 file on microSD | 49.82 MiB |
+| FHQ4 file on the memory stick | 47.11 MiB (weight region 46.61 MiB, 187 blocks) |
 
 The cache is allocated only after the required runtime state succeeds. Cache
 blocks are 256 KiB. Allocation stops safely if the requested target is not
 available and releases one block of heap headroom after a ceiling failure.
 
 The default 44 MiB heap target plus the 4 MiB volatile partition caches
-the embedding plus about 23 of 24 layers when the firmware grants full
-high memory; the allocator backs off gracefully on smaller layouts.
+the whole version-3 weight region at context 384 on the reference
+PSP-2000 (section 2.10: ~1 MiB to spare by the measured budget); the fit
+policy trades up to 25% of the context for it on a console that is
+slightly short, and the allocator backs off gracefully on smaller
+layouts.
 cache_mb (llmpsp_config.cfg) is clamped to 0 through 46 MiB (heap only;
 the volatile 4 MiB is added automatically unless the value is 0).
 
-## 6. Why weights are partly cached
+## 6. Why weights were partly cached
 
-The FHQ4 weight region is about 49.33 MiB. Fully resident weights plus the
-8.94 MiB model/runtime tables already exceed a safe PSP application budget
-before executable and system overhead.
+Until section 2.10 the FHQ4 weight region was about 49.33 MiB, and with
+the 8.94 MiB of model/runtime tables it exceeded the PSP's budget. The
+version-3 region is 46.61 MiB and the runtime 5.13 MiB at context 384,
+which fits the reference PSP-2000 completely (section 2.10); everything
+below still describes what happens when a console, a larger context or
+a smaller cache_mb leaves blocks on the card.
 
 Weights are stored in execution order:
 
@@ -419,8 +802,9 @@ then caches as many early layers as fit.
 Every model read checks the cache first. If a matrix crosses the cache
 boundary, cached rows are used directly and the remainder is read with one
 sequential file seek. With cache 0, the entire model streams from microSD.
-With cache 44 plus the volatile partition, only about 1 late layer
-streams from the card (about 1.7 MiB per token).
+With cache 44 plus the volatile partition the whole model is cached on
+the reference console; each block still missing streams 256 KiB per
+token.
 
 ## 7. Falcon-H1 Tiny architecture
 
@@ -443,7 +827,7 @@ The exact configuration accepted by the converter is:
 | Mamba convolution width | 4 |
 | Mamba input projection | 1,688 |
 | Model training context | 262,144 |
-| PSP runtime context | 512 |
+| PSP runtime context | 512 maximum, 384 default |
 | RoPE theta | 100,000,000,000 |
 | RMSNorm epsilon | 0.00001 |
 
@@ -501,7 +885,8 @@ The 896 convolution channels contain:
 Each layer keeps:
 
 - a 4-sample depthwise convolution history for 896 channels;
-- a recurrent state of 768 by 64 floats.
+- a recurrent state of 768 by 64 values (float16 by default since
+  section 2.10, float32 with state_f16 = 0).
 
 For each Mamba head:
 
@@ -522,19 +907,48 @@ The 768-channel result is projected back to 512.
 FHQ4 is a project-specific, little-endian format designed for direct PSP file
 access. It is not GGUF.
 
-### 8.1 Q4_0 matrix blocks
+### 8.1 Q4_0 matrix blocks and tile groups
 
-Every dense matrix row is divided into groups of 32 values. Each group uses:
+Every dense matrix row is divided into blocks of 32 values. Each block
+uses (version 3):
 
-- one IEEE float16 scale: 2 bytes;
+- one signed 8-bit scale code: 1 byte;
 - 32 signed 4-bit values packed into 16 bytes.
 
 Total:
 
-    18 bytes for 32 weights
+    17 bytes for 32 weights (18 with the fp16 scales of versions 1 and 2)
 
-Rows remain independently addressable. The runtime can seek directly to one
-embedding row or stream a complete matrix without parsing metadata.
+Quantization: weight w in -8..7 is stored as the nibble w + 8, value =
+scale * w. The scale of code c is 0 for c == 0, otherwise
+sign(c) * float_from_bits((|c| + k) << (23 - m)), with the matrix's
+mantissa width m (3..5) and bias k from the scale-code table (section
+8.2); the converter picks the scale as in version 1 (the block's signed
+maximum / -8), replaces it by its nearest code and rounds the weights
+against the decoded scale. In the version-1 row layout a row was cols/32
+blocks of {fp16 scale, 16 bytes}, byte j holding weight j (low nibble)
+and weight j + 16 (high nibble).
+
+Versions 2 and 3 store four consecutive rows as one tile group of exactly
+4 x row bytes (B = cols / 32 blocks):
+
+    B * 4 bytes    scale codes: block 0 rows 0..3, block 1 rows 0..3, ...
+                   (version 2: B * 8 bytes of fp16 scales, same order)
+    B * 64 bytes   tiles: four 16-byte tiles per block; word r of tile t
+                   of block b holds row r's version-1 bytes 4t..4t+3,
+                   each XOR 0x80 (high nibble becomes two's complement)
+
+Every Q4 row count is a multiple of 4 (32768, 512, 128, 1688, 768), every
+column count a multiple of 128 (512, 768: a multiple of 4 blocks, so the
+tiles starting B * 4 bytes into a group and the 68 * B byte groups stay
+aligned), and every Q4 offset in the weight region is a multiple of 16,
+so every group and tile is 16-byte aligned for the VFPU's lv.q. Converter,
+re-pack tool and loader check all three.
+Groups remain
+independently addressable: the runtime seeks directly to the group that
+holds one embedding row, or streams a matrix group by group, without
+parsing metadata. src/falcon_q4_tile_psp.h explains why the kernel wants
+this layout.
 
 Small tensors stay float32:
 
@@ -548,10 +962,14 @@ Small tensors stay float32:
 
 The first 256 bytes are the FHQ4 header. It contains:
 
-- magic FHQ4 and format version 1;
+- magic FHQ4 and format version 3 (versions 1 and 2, with fp16 scales,
+  are rejected with a message to run tools/repack_fhq4.py);
 - file, tokenizer, and weight offsets;
-- 25 architecture/token fields;
-- RoPE theta, RMS epsilon, embedding multiplier, and LM-head multiplier.
+- 25 architecture/token fields (the context field is the maximum, 512;
+  the app's default context is 384, see section 2.9);
+- RoPE theta, RMS epsilon, embedding multiplier, and LM-head multiplier;
+- at byte 160 (version 3): u32 offset, u32 entry count (217) and u32
+  entry size (8) of the scale-code table.
 
 The TOK2 tokenizer section follows. It contains:
 
@@ -559,6 +977,12 @@ The TOK2 tokenizer section follows. It contains:
 - token IDs sorted by piece for binary lookup;
 - merge rank by token ID;
 - a byte-to-token table.
+
+Version 3 then has, at the next 16-byte boundary, the scale-code table:
+one 8-byte entry per Q4 matrix in file order (u32 offset relative to the
+weight region, u8 mantissa bits m, u8 0, u16 bias k). The loader requires
+each entry to name the matrix its own offset walk finds and every code to
+decode to a normal float.
 
 Weights begin at the next 64-byte boundary and follow a fixed order known by
 both converter and runtime. There is no runtime tensor-name table, which saves
@@ -605,9 +1029,17 @@ At application startup:
 2. CPU/bus clocks are set to 333/166 MHz.
 3. model.fhq4 is opened and its header is validated.
 4. The 521 KiB tokenizer section is loaded.
-5. Runtime arrays, recurrent state, and the 512-token KV cache are allocated.
-6. cache_mb.txt is read and the requested weight prefix is cached.
-7. The editor appears.
+5. Runtime arrays, recurrent state (float16 unless state_f16 = 0), and
+   the KV cache for the configured context (default 384) are allocated;
+   if they do not fit, the context backs off in 16-token steps down to
+   128 (section 2.9).
+6. The requested weight prefix is cached (cache_mb, volatile memory
+   first).
+7. Fit policy (section 2.10): if blocks stayed uncached because the heap
+   ran out, the context shrinks by the fewest tokens (at most 25%) that
+   let them all be cached, else it stays and they stream.
+8. The raw read window is allocated only if anything streams.
+9. The editor appears.
 
 When Start is pressed:
 
@@ -618,12 +1050,12 @@ When Start is pressed:
 5. A token is sampled from the final logits.
 6. Its decoded bytes are appended to the output screen.
 7. The sampled token is fed back into the model until a stop token, Circle,
-   the 128-new-token limit, or the 512-token context limit is reached.
+   the 128-new-token limit, or the context limit is reached.
 8. After a reply, the app returns to the keyboard with the conversation
    still active: the next message is appended as a chat turn and only its
    delta tokens are processed (falcon_generate_turn keeps all state).
-   SELECT starts a new conversation. When the 512-token context is nearly
-   full the app asks for a new conversation.
+   SELECT starts a new conversation. When the context (the granted
+   value) is nearly full the app asks for a new conversation.
 
 ## 10.1 Screen
 
@@ -738,10 +1170,20 @@ a kernel-only import that a user-mode module must not link (section 2.1).
 
 `tools/main_psp_autotest.c` + `tools/Makefile.autotest` build
 FalconAutoTest (packaged in build/FalconTest). It runs the "hi" prompt
-with no input, mirrors the main app's runtime path exactly, and writes
+with no input, mirrors the main app's runtime path (context 384 with the
+same back-off, prefetch off, raw streaming), and writes
 falcon_autotest_log.txt beside its EBOOT. It searches for model.fhq4
 next to itself, then in ms0:/PSP/GAME/LLMPSP/, then ef0:. Use it to
-reproduce on-device issues deterministically.
+reproduce on-device issues deterministically. Optional files beside it:
+cache_mb.txt (default 32), context.txt, prefetch.txt (1 = prefetch with
+a striped cache), autotest_free_kb.txt (fills the heap first, to
+exercise the context back-off), autotest_heap_blocks.txt (at boot, caps
+the heap so exactly that many 256 KiB blocks fit: 199 models the
+reference PSP-2000), fit.txt and state_f16.txt (0 turns the fit policy
+or the float16 state off; both default to 1 as in the app). It logs the
+heap in blocks at boot, the fit decision and a "[mem]" budget line
+(runtime, cached blocks, uncached blocks, heap left). The "[check]
+realigned groups" line must read 0.
 
 ## 12. Building the model
 
@@ -766,9 +1208,20 @@ Or convert an existing checkpoint:
       --output model.fhq4 \
       --context 512
 
-The converter validates tensor names and shapes before writing. It also writes
-model.fhq4.json containing size, architecture, quantization description, and
-SHA-256.
+The converter validates tensor names and shapes before writing, writes FHQ4
+version 3 (sections 2.10 and 8.1), and checks every Q4 matrix's row count,
+column count and 16-byte alignment. It also writes model.fhq4.json containing size,
+architecture, quantization description, and SHA-256.
+
+To convert an existing version-1 or version-2 model.fhq4 without the
+checkpoint:
+
+    python tools/repack_fhq4.py model_v2.fhq4 model.fhq4
+
+It always finishes by decoding both files and comparing them (version
+2 -> 3: identical nibbles and float tensors, and the scale-code error per
+matrix type; --to 2 does the lossless 1 -> 2 step only; --check compares
+an existing pair). It does not write a manifest.
 
 ## 13. Building the PSP application
 
@@ -825,6 +1278,25 @@ Arguments after the model are prompt, maximum new tokens, and cache MiB.
 Compile tools/tokenizer_test.c against the same three runtime sources and run
 it with model.fhq4. All cases and the chat template must report ok.
 
+tools/host_check.sh OUTDIR [LABEL] builds everything with -Wall -Wextra
+-Werror and runs the whole suite: generation scenarios, cache and striped
+cache equivalence, tokenizer, multiturn, sampler equivalence
+(tools/sampler_test.c), context back-off and the fit policy
+(tools/context_backoff_test.c) and the fpflag probe (must report no
+OVERFLOW/INVALID/DIVBYZERO). The generation, equivalence and fpflag runs
+happen for both Mamba state modes (the host tools read STATE_F16, default
+1 like the app). Set MODEL=path to test a model other than the root
+model.fhq4.
+
+tools/quality_eval.c is the numeric quality gate of section 2.10: build
+it once against the v1.3 sources (git show v1.3:...) and run "ref" with
+the version-2 model to dump the reference, then build it against the
+current sources and run "cand MODEL DUMP [STATE_MODE]"; "state" reports
+the Mamba state range over long generations. Compile with
+-DFALCON_EVAL_V2 to read the version-2 model with the current code (bit-
+identical to v1.3), and add -DFALCON_HOST_SUM4 for the summation-order
+yardstick. host_check.sh only checks that it builds.
+
 Useful equivalence test:
 
 1. Run a prompt with cache 0.
@@ -874,9 +1346,13 @@ When changing architecture code:
 6. Test cache 0 on hardware before increasing cache.
 7. Preserve per-layer power ticks during any long new kernel.
 8. After touching src/falcon_q4_psp.c (or anything feeding it), run the
-   autotest EBOOT in PPSSPP twice (default cache and cache 0) and check
-   both replies match the host build; the VFPU kernel is only covered by
-   this end-to-end path because host builds use the scalar kernel.
+   VFPU unit test and the autotest EBOOT in PPSSPP twice (default cache
+   and cache 0) and check both replies match each other (and the host
+   build, give or take a token, section 2.7); the VFPU kernels are only
+   covered by these paths because host builds use the scalar kernel.
+   PPSSPP does not fault on misaligned lv.q/sv.q: also check the
+   autotest's "realigned groups 0" and keep every new buffer that feeds
+   a kernel 16-byte aligned.
 
 When changing memory:
 
@@ -884,28 +1360,37 @@ When changing memory:
 - use size_t for allocation products;
 - keep context-dependent KV calculations explicit;
 - leave heap headroom for prompt BPE and generation history;
-- never assume ARK storage-backed memory behaves like normal RAM.
+- never assume ARK storage-backed memory behaves like normal RAM;
+- keep falcon_runtime_plan_bytes in step with falcon_runtime_init (the
+  back-off test compares them) and re-run the budget with the autotest's
+  autotest_heap_blocks.txt = 199 (section 2.10).
 
-When changing quantization:
+When changing quantization or any numerics:
 
 - preserve independent row addressing;
 - update row-byte calculations in converter and runtime together;
 - validate embedding-row decode and full matrix dot products;
-- change the FHQ4 version if binary compatibility breaks.
+- change the FHQ4 version if binary compatibility breaks;
+- run tools/quality_eval.c against the v1.3 reference and report the
+  table of section 2.10 next to the yardstick.
 
 ## 17. Known limitations
 
 - Only Falcon-H1-Tiny-90M-Instruct is accepted.
-- PSP context is 512 tokens.
+- PSP context is 384 tokens by default, at most 512.
 - The UI generates at most max_reply_tokens (llmpsp_config.cfg,
   default 128) new tokens per request.
 - Input keyboard is ASCII-oriented.
 - The transcript keeps roughly 6 KiB of scrollback, not the whole session.
 - The debug font replaces non-ASCII output bytes visually with question marks.
-- The Q4 matvecs run on the VFPU (v1.7) and the streamed weight tail is
-  prefetched asynchronously (v1.8); the attention and Mamba loops are
-  still scalar (the next speed lever).
+- The Q4 matvecs run on the VFPU four rows at a time (section 2.9); the
+  attention and Mamba loops have VFPU kernels too (v1.11). Asynchronous
+  prefetch exists but is off by default (section 2.6).
 - Weight caching is prefix-based, not a layer-frequency cache.
+- Since section 2.10 replies differ from v1.3 (8-bit scale codes and
+  the float16 state change numerics; quality table there). The fit
+  policy can grant a context slightly below the configured one; the
+  header meter shows the granted value.
 - Conversation history lives in model state only; there is no transcript
   view of earlier turns on screen.
 - The v1.7 performance build (VFPU kernel, volatile-memory cache,

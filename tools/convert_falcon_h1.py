@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Convert Falcon-H1-Tiny-90M-Instruct to FalconPSP's streamed FHQ4 format.
 
-Needs NumPy only. Dense matrices become row-addressable Q4_0 and the exact
-Falcon byte-level BPE vocabulary and merge ranks are embedded in the output.
+Needs NumPy only. Dense matrices become Q4_0 with one 8-bit scale code per
+32-weight block, stored as four-row tile groups (FHQ4 version 3, the layout
+the PSP VFPU kernel reads; see PROJECT.md sections 2.10 and 8) and the
+exact Falcon byte-level BPE vocabulary and merge ranks are embedded in the
+output.
 """
 from __future__ import annotations
 import argparse
@@ -14,9 +17,18 @@ import urllib.request
 import numpy as np
 
 MAGIC = b"FHQ4"
-VERSION = 1
+VERSION = 3
 HEADER_BYTES = 256
 QK = 32
+GROUP_ROWS = 4
+# Version 3 header fields after the four header floats (bytes 140..155):
+# absolute offset, entry count and entry size of the per-matrix scale-code
+# table that sits between the tokenizer and the weight region.
+QPARAM_HEADER = 160
+QPARAM_ENTRY = 8
+# Mantissa widths a matrix may use for its 8-bit block-scale codes; the PSP
+# has one kernel variant per width (src/falcon_q4_psp.c).
+SCALE_MANTISSA_BITS = (3, 4, 5)
 DEFAULT_CONTEXT = 512
 DEFAULT_MODEL = "tiiuae/Falcon-H1-Tiny-90M-Instruct"
 FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors")
@@ -66,7 +78,161 @@ class SafeTensors:
             raise ValueError(f"unsupported dtype {dtype} for {name}")
         return values.reshape(info["shape"])
 
+def rows_to_tiles(row_bytes: bytes, rows: int, cols: int) -> bytes:
+    """FHQ4 version-1 Q4_0 rows -> version-2 tile groups (lossless).
+
+    Version 1 stores each row as cols/32 blocks of {fp16 scale, 16 packed
+    bytes} (byte j: low nibble = weight j + 8, high nibble = weight
+    j + 16 + 8). Version 2 stores four rows per group:
+    blocks * 8 bytes of scales (block 0 rows 0..3, block 1 rows 0..3, ...)
+    then blocks * 64 bytes of tiles, where word r of tile t of block b
+    holds row r's packed bytes 4t..4t+3 XOR 0x80. Same 18 bytes per 32
+    weights; only the order and the high-nibble encoding change.
+    """
+    # An even block count keeps the tiles (blocks * 8 bytes into the
+    # group) 16-byte aligned for the PSP kernel's lv.q.
+    if rows % GROUP_ROWS or cols % (2 * QK):
+        raise ValueError(f"tile groups need rows % {GROUP_ROWS} == 0 and "
+                         f"cols % {2 * QK} == 0, got {rows}x{cols}")
+    blocks = cols // QK
+    data = np.frombuffer(row_bytes, dtype=np.uint8)
+    if data.size != rows * blocks * 18:
+        raise ValueError("Q4 byte count does not match the shape")
+    data = data.reshape(rows // GROUP_ROWS, GROUP_ROWS, blocks, 18)
+    # scales: [group, row, block, 2] -> [group, block, row, 2]
+    scales = data[..., :2].transpose(0, 2, 1, 3).reshape(rows // GROUP_ROWS, -1)
+    # packed: [group, row, block, tile, k] -> [group, block, tile, row, k]
+    packed = (data[..., 2:] ^ np.uint8(0x80)).reshape(
+        rows // GROUP_ROWS, GROUP_ROWS, blocks, 4, 4)
+    tiles = packed.transpose(0, 2, 3, 1, 4).reshape(rows // GROUP_ROWS, -1)
+    return np.ascontiguousarray(np.concatenate([scales, tiles], axis=1)).tobytes()
+
+def scale_code_valid(m: int, k: int) -> bool:
+    """Every magnitude index 1..128 must decode to a normal, finite float."""
+    return (m in SCALE_MANTISSA_BITS and 0 <= k < 65536 and
+            ((1 + k) >> m) >= 1 and ((128 + k) >> m) <= 254)
+
+
+def scale_table(m: int, k: int) -> np.ndarray:
+    """Decoded value of every scale-code byte 0..255 (FHQ4 version 3).
+
+    The byte is a signed int8 c. c == 0 is a zero scale; otherwise the
+    magnitude is the float32 whose bit pattern is (|c| + k) << (23 - m),
+    i.e. a minifloat with m mantissa bits placed by the per-matrix bias k,
+    and the sign is the sign of c. The C runtime (scale_code_value in
+    src/falcon_h1.c) and the PSP kernel (vi2f/vabs/vadd/vf2iz/vsgn in
+    src/falcon_q4_tile_psp.h) compute exactly these bits."""
+    if not scale_code_valid(m, k):
+        raise ValueError(f"invalid scale code parameters m={m} k={k}")
+    c = np.arange(256, dtype=np.uint8).view(np.int8).astype(np.int32)
+    magnitude = ((np.abs(c) + k).astype(np.uint32) << np.uint32(23 - m))
+    values = magnitude.view(np.float32) * np.sign(c).astype(np.float32)
+    values[c == 0] = 0.0
+    return values.astype(np.float32)
+
+
+def encode_scales(scales: np.ndarray, m: int, k: int) -> np.ndarray:
+    """Nearest code (linear distance) for every scale; int8, never -128."""
+    table = scale_table(m, k)
+    positive = table[:128]                      # codes 0..127, increasing
+    a = np.abs(scales.astype(np.float32))
+    hi = np.clip(np.searchsorted(positive, a), 1, 127)
+    lo = hi - 1
+    pick_lo = (a - positive[lo]) <= (positive[hi] - a)
+    index = np.where(pick_lo, lo, hi).astype(np.int16)
+    codes = np.where(scales < 0, -index, index)
+    return codes.astype(np.int8)
+
+
+def choose_scale_code(scales: np.ndarray, energy: np.ndarray):
+    """Per-matrix (m, k) minimising the added weight error energy
+    sum(energy * (decoded - scale)^2), energy = sum of squared signed
+    nibbles of the block. Returns (m, k, codes, decoded)."""
+    s = scales.astype(np.float32).ravel()
+    e = energy.astype(np.float64).ravel()
+    top = float(np.abs(s).max())
+    best = None
+    if top == 0.0:
+        m, k = 4, 112 << 4
+        codes = np.zeros(scales.shape, np.int8)
+        return m, k, codes, np.zeros(scales.shape, np.float32)
+    # Subsample huge matrices for the search; the winner is re-encoded in full.
+    if s.size > 200000:
+        pick = np.random.default_rng(0).choice(s.size, 200000, replace=False)
+        s_search, e_search = s[pick], e[pick]
+    else:
+        s_search, e_search = s, e
+    for m in SCALE_MANTISSA_BITS:
+        # Smallest k whose top code (127) still reaches the largest scale.
+        top_bits = int(np.array([top], np.float32).view(np.uint32)[0])
+        k_top = -(-top_bits // (1 << (23 - m))) - 127
+        for k in range(k_top - (2 << m), k_top + 2):
+            if not scale_code_valid(m, k):
+                continue
+            table = scale_table(m, k)
+            decoded = table[encode_scales(s_search, m, k).view(np.uint8)]
+            err = float(np.sum(e_search * (decoded.astype(np.float64) -
+                                           s_search) ** 2))
+            if best is None or err < best[0]:
+                best = (err, m, k)
+    _, m, k = best
+    codes = encode_scales(scales, m, k)
+    return m, k, codes, scale_table(m, k)[codes.view(np.uint8)]
+
+
+def pack_groups_v3(codes: np.ndarray, quants: np.ndarray) -> bytes:
+    """[rows, blocks] int8 scale codes + [rows, cols] nibbles (w + 8) ->
+    version-3 tile groups. A group of four rows with B blocks is
+    B * 4 code bytes (block 0 rows 0..3, block 1 rows 0..3, ...) followed
+    by the version-2 tiles (B * 64 bytes): word r of tile t of block b holds
+    row r's packed bytes 4t..4t+3 (low nibble weight j + 8, high nibble
+    weight j + 16 + 8) XOR 0x80. 17 bytes per 32 weights."""
+    rows, cols = quants.shape
+    if rows % GROUP_ROWS or cols % (4 * QK):
+        # B % 4 == 0 keeps both the tiles (B * 4 bytes into the group) and
+        # the group size (68 * B) 16-byte aligned for the PSP's lv.q.
+        raise ValueError(f"version-3 groups need rows % {GROUP_ROWS} == 0 and "
+                         f"cols % {4 * QK} == 0, got {rows}x{cols}")
+    blocks = cols // QK
+    groups = rows // GROUP_ROWS
+    q = quants.astype(np.uint8).reshape(rows, blocks, QK)
+    packed = (q[..., :16] | (q[..., 16:] << 4)) ^ np.uint8(0x80)
+    head = codes.view(np.uint8).reshape(groups, GROUP_ROWS, blocks)
+    head = head.transpose(0, 2, 1).reshape(groups, -1)
+    tiles = packed.reshape(groups, GROUP_ROWS, blocks, 4, 4)
+    tiles = tiles.transpose(0, 2, 3, 1, 4).reshape(groups, -1)
+    return np.ascontiguousarray(np.concatenate([head, tiles], axis=1)).tobytes()
+
+
+def q4_v3(values: np.ndarray):
+    """Q4_0 with 8-bit scale codes: returns (m, k, version-3 bytes).
+
+    The block scale is chosen as in version 2 (signed maximum / -8), then
+    replaced by its nearest code, and the weights are quantised against
+    the DECODED scale so the nibbles absorb part of the code error."""
+    matrix = np.asarray(values, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[1] % QK:
+        raise ValueError(f"Q4 shape must be [rows, cols divisible by {QK}], got {matrix.shape}")
+    rows, cols = matrix.shape
+    blocks = np.ascontiguousarray(matrix).reshape(rows, cols // QK, QK)
+    maxima = np.argmax(np.abs(blocks), axis=2)
+    signed_max = np.take_along_axis(blocks, maxima[..., None], axis=2)[..., 0]
+    scales = (signed_max / -8.0).astype(np.float32)
+    inverse = np.zeros_like(scales)
+    np.divide(1.0, scales, out=inverse, where=scales != 0.0)
+    first = np.clip(np.trunc(blocks * inverse[..., None] + 8.5), 0, 15) - 8
+    energy = np.sum(first * first, axis=2)
+    m, k, codes, decoded = choose_scale_code(scales, energy)
+    inverse = np.zeros_like(decoded)
+    np.divide(1.0, decoded, out=inverse, where=decoded != 0.0)
+    quants = np.clip(np.trunc(blocks * inverse[..., None] + 8.5), 0, 15)
+    quants = quants.astype(np.uint8).reshape(rows, cols)
+    return m, k, pack_groups_v3(codes, quants)
+
+
 def q4_0_bytes(values: np.ndarray) -> bytes:
+    """The version-1/2 quantiser (fp16 scales, row layout); no longer
+    written, kept as the reference for what versions 1 and 2 contain."""
     matrix = np.asarray(values, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[1] % QK:
         raise ValueError(f"Q4 shape must be [rows, cols divisible by {QK}], got {matrix.shape}")
@@ -174,11 +340,35 @@ def write_f32(file, values: np.ndarray, shape: tuple[int, ...], name: str) -> No
         raise ValueError(f"{name} shape {values.shape}, expected {shape}")
     file.write(values.astype("<f4", copy=False).tobytes())
 
-def write_q4(file, values: np.ndarray, shape: tuple[int, int], name: str) -> None:
+def write_q4_matrix(file, values: np.ndarray, shape: tuple[int, int],
+                    name: str, weights_offset: int,
+                    params: list[tuple[int, int, int]]) -> None:
     if tuple(values.shape) != shape:
         raise ValueError(f"{name} shape {values.shape}, expected {shape}")
-    print(f"[quantize] {name:<55} {values.shape}")
-    file.write(q4_0_bytes(values))
+    # The PSP kernel loads tile groups with lv.q, which faults on real
+    # hardware unless the address is 16-byte aligned.
+    if (file.tell() - weights_offset) % 16 or shape[0] % GROUP_ROWS:
+        raise ValueError(f"{name}: Q4 matrix not 16-byte aligned or rows "
+                         f"not a multiple of {GROUP_ROWS}")
+    m, k, data = q4_v3(values)
+    print(f"[quantize] {name:<55} {values.shape} scale code m={m} k={k}")
+    params.append((file.tell() - weights_offset, m, k))
+    file.write(data)
+
+
+def qparam_table(params: list[tuple[int, int, int]]) -> bytes:
+    """One 8-byte entry per Q4 matrix in file order: u32 offset relative to
+    the weight region, u8 mantissa bits m, u8 0, u16 bias k."""
+    out = bytearray()
+    for offset, m, k in params:
+        if not scale_code_valid(m, k):
+            raise ValueError(f"invalid scale code parameters m={m} k={k}")
+        out += struct.pack("<IBBH", offset, m, 0, k)
+    return bytes(out)
+
+
+def q4_matrix_count(layers: int) -> int:
+    return 1 + 9 * layers
 
 def require_config(config: dict) -> None:
     expected = {
@@ -225,8 +415,17 @@ def convert(model_dir: Path, output: Path, context: int) -> None:
             out.write(b"\0" * HEADER_BYTES)
             tokenizer_offset = out.tell()
             out.write(tokenizer)
+            align_file(out, 16)
+            qparam_offset = out.tell()
+            qparam_count = q4_matrix_count(layers)
+            out.write(b"\0" * (qparam_count * QPARAM_ENTRY))
             align_file(out)
             weights_offset = out.tell()
+            params: list[tuple[int, int, int]] = []
+
+            def write_q4(file, values, shape, name):
+                write_q4_matrix(file, values, shape, name, weights_offset,
+                                params)
             write_q4(out, tensors.tensor("model.embed_tokens.weight"),
                      (vocab, dim), "model.embed_tokens.weight")
             for layer in range(layers):
@@ -284,6 +483,12 @@ def convert(model_dir: Path, output: Path, context: int) -> None:
                              float(config["rope_theta"]), float(config["rms_norm_eps"]),
                              float(config["embedding_multiplier"]),
                              float(config["lm_head_multiplier"]))
+            if len(params) != qparam_count:
+                raise ValueError("Q4 matrix count does not match the table")
+            struct.pack_into("<3I", header, QPARAM_HEADER, qparam_offset,
+                             qparam_count, QPARAM_ENTRY)
+            out.seek(qparam_offset)
+            out.write(qparam_table(params))
             out.seek(0)
             out.write(header)
     finally:
@@ -301,7 +506,9 @@ def convert(model_dir: Path, output: Path, context: int) -> None:
                          "mamba_dim": m_dim, "mamba_heads": m_heads,
                          "mamba_state": m_state, "vocab": vocab,
                          "model_context": model_context, "psp_context": context},
-        "quantization": "row-addressable Q4_0; matrices streamed from storage",
+        "quantization": ("Q4_0 with 8-bit minifloat block-scale codes in "
+                         "four-row tile groups (FHQ4 version 3, 17 bytes "
+                         "per 32 weights)"),
     }
     output.with_suffix(output.suffix + ".json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

@@ -31,16 +31,56 @@ void falcon_sampler_init(FalconSampler *sampler, float temperature,
     sampler->rng = seed ? seed : 0x9e3779b97f4a7c15ULL;
 }
 
-static int in_recent_history(int id, const int *history, int count) {
-    int begin = count > 64 ? count - 64 : 0;
+/* The repetition penalty applies to ids among the last 64 history
+ * entries. Instead of scanning those 64 entries for each of the 32,768
+ * logits, the recent ids are marked in a bitmap once per call (and
+ * unmarked afterwards), so a lookup is O(1) and a call costs
+ * O(vocab + history). The scan loops below are unchanged, so the chosen
+ * token is identical in every case, ties and NaNs included. Ids at or
+ * above the bitmap size (never, for this model's vocabulary) keep the
+ * linear scan. */
+#define RECENT_WINDOW 64
+#define RECENT_BITMAP_IDS 32768
+
+static uint32_t recent_bits[RECENT_BITMAP_IDS / 32];
+
+typedef struct {
+    const int *ids;
+    int begin, end;
+} RecentHistory;
+
+static void recent_mark(RecentHistory *recent, const int *history,
+                        int count) {
     int i;
-    for (i = begin; i < count; ++i)
-        if (history[i] == id) return 1;
+    recent->ids = history;
+    recent->begin = count > RECENT_WINDOW ? count - RECENT_WINDOW : 0;
+    recent->end = count;
+    for (i = recent->begin; i < count; ++i) {
+        unsigned int id = (unsigned int)history[i];
+        if (id < RECENT_BITMAP_IDS) recent_bits[id >> 5] |= 1u << (id & 31u);
+    }
+}
+
+static void recent_clear(const RecentHistory *recent) {
+    int i;
+    for (i = recent->begin; i < recent->end; ++i) {
+        unsigned int id = (unsigned int)recent->ids[i];
+        if (id < RECENT_BITMAP_IDS) recent_bits[id >> 5] = 0;
+    }
+}
+
+static int in_recent_history(int id, const RecentHistory *recent) {
+    int i;
+    if (id >= 0 && id < RECENT_BITMAP_IDS)
+        return (recent_bits[(unsigned int)id >> 5] >>
+                ((unsigned int)id & 31u)) & 1u;
+    for (i = recent->begin; i < recent->end; ++i)
+        if (recent->ids[i] == id) return 1;
     return 0;
 }
 static float penalized(const FalconSampler *sampler, float value, int id,
-                       const int *history, int history_count) {
-    if (in_recent_history(id, history, history_count))
+                       const RecentHistory *recent) {
+    if (in_recent_history(id, recent))
         return value < 0.0f ? value * sampler->repetition_penalty :
                               value / sampler->repetition_penalty;
     return value;
@@ -49,24 +89,25 @@ static float penalized(const FalconSampler *sampler, float value, int id,
 int falcon_sample(FalconSampler *sampler, const float *logits, int vocab_size,
                   const int *history, int history_count) {
     Candidate top[FALCON_TOP_K_MAX];
+    RecentHistory recent;
     int count = 0, i;
+    recent_mark(&recent, history, history_count);
     if (sampler->temperature <= 0.0f) {
         int best = 0;
-        float best_value = penalized(sampler, logits[0], 0,
-                                     history, history_count);
+        float best_value = penalized(sampler, logits[0], 0, &recent);
         for (i = 1; i < vocab_size; ++i) {
-            float value = penalized(sampler, logits[i], i,
-                                    history, history_count);
+            float value = penalized(sampler, logits[i], i, &recent);
             if (value > best_value) {
                 best_value = value;
                 best = i;
             }
         }
+        recent_clear(&recent);
         return best;
     }
     for (i = 0; i < vocab_size; ++i) {
-        float value = penalized(sampler, logits[i], i,
-                                history, history_count) / sampler->temperature;
+        float value = penalized(sampler, logits[i], i, &recent) /
+                      sampler->temperature;
         int position;
         if (count == sampler->top_k && value <= top[count - 1].logit) continue;
         position = count < sampler->top_k ? count++ : count - 1;
@@ -77,6 +118,7 @@ int falcon_sample(FalconSampler *sampler, const float *logits, int vocab_size,
         top[position].logit = value;
         top[position].id = i;
     }
+    recent_clear(&recent);
     if (count <= 0) return 0;
     {
         float probabilities[FALCON_TOP_K_MAX];
