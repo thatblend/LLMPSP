@@ -8,7 +8,7 @@ It is not streamed from a server or from an API, it's a full 90M conversational 
 
 The current version runs Falcon-H1-Tiny-90M-Instruct, a 90 million parameter instruction-tuned language model, quantized to 4 bits. This model is actually a lot more capable than the 90M parameter count would suggest and it can answer basic questions, has some decent general knowledge and can generate poems, short stories, draft your work email (good luck) or write code (that doesn't work). It's not really useful for anything, but it's fun to actually see a half-decent model working locally on the PSP.
 
-Don't expect good performance as it has to load part of the model from the memory stick, but it is fast enough to be somewhat useable. On a PSP-3000 it generates about 0.5 - 0.6 tokens per second, perhaps more if you use CPU overclock.
+Since v1.4 the whole model fits in the PSP's RAM, so nothing is read from the memory stick while it generates. It does about 2 tokens per second with a CPU overclock, a bit less at the stock 333 MHz.
 
 ## Install
 
@@ -18,7 +18,7 @@ Don't expect good performance as it has to load part of the model from the memor
 
 You need a PSP-2000/PSP-3000/Street/GO running CFW (ARK-4, ARK-5, PRO, ME - anything current). A PSP-1000 only has 32 MB of RAM and it won't work.
 
-Settings live in `llmpsp_config.cfg` next to the EBOOT: cache size, context length, sampling temperature, reply length cap, CPU clock. The defaults are ok for a stock PSP but you can always tweak them and try different settings.
+Settings live in `llmpsp_config.cfg` next to the EBOOT: cache size, context length, sampling temperature, reply length cap, CPU clock and the keyboard layout (alphabetical or QWERTY). The defaults are ok for a stock PSP but you can always tweak them and try different settings.
 
 ## How it works
 
@@ -26,16 +26,16 @@ The model is a hybrid: each of the 24 layers runs grouped-query attention (8 que
 
 Weights are converted offline into **FHQ4**, a small custom format built for a console that has to read from a memory card:
 
-- Dense matrices are Q4_0-style - 32 weights per block, one fp16 scale, 18 bytes per block. Every row stays independently addressable, so the runtime can seek straight to a single embedding row without parsing anything.
+- Dense matrices are Q4_0-style: 32 weights per block, but with an 8-bit scale code instead of an fp16 scale, so 17 bytes per block. Rows are stored in groups of four so the VFPU can work on four rows at once, and each row can still be read on its own, so the runtime can fetch a single embedding row without parsing anything.
 - Norms, conv weights, and Mamba `dt_bias`/`A_log`/`D` stay fp32. They're tiny (~0.5 MB total) and get loaded into RAM at startup.
 - The tokenizer, all 32,768 pieces and merge ranks is embedded in the file.
 - No tensor name table. Both the converter and the runtime compute the same offsets in the same order, and the loader rejects the file if the final computed offset doesn't equal the real file size.
 
-The whole thing is 52 MB, which doesn't fit in a 64 MB console alongside ~8 MB of runtime state. So the runtime allocates all correctness-critical state first, then caches as much of the weight file as will fit - so 44 MB of heap plus the 4 MB volatile partition the firmware isn't using, in 256 KB blocks and streams the last few MB from the memory stick per token. Cache size only affects speed, greedy output is identical at any setting.
+The whole thing is 49 MB, and with the Mamba recurrent state kept as float16 it now fits in a 64 MB console together with the runtime state. The runtime allocates all correctness-critical state first, then caches the weight file in 256 KB blocks in the heap plus the 4 MB volatile partition the firmware isn't using. At the default 384-token context the whole model stays in RAM. If a console comes up slightly short, it gives up a few tokens of context instead of slowing down. Larger contexts (up to 1024) still work: whatever doesn't fit streams from the memory stick each token, just slower.
 
 The KV cache is int8 with a float scale per head, which roughly halves it versus fp16.
 
-The Q4 matrix-vector kernels, the int8 attention loops, and the Mamba state update run on the PSP's VFPU vector unit rather than the scalar FPU.
+The Q4 matrix-vector kernel (four rows per pass), the int8 attention loops, and the Mamba state update run on the PSP's VFPU vector unit rather than the scalar FPU.
 
 ## Build it yourself
 
@@ -62,7 +62,7 @@ cc -O3 -std=c99 -Iinclude src/falcon_h1.c src/falcon_tokenizer.c \
 ./falcon_host_cli build/LLMPSP/model.fhq4 "hi" 32 44
 ```
 
-`tools/` also has the tokenizer regression vectors, a multi-turn equivalence test, an FPU flag probe, a VFPU kernel unit test that runs on the console, and a host renderer that prints the PSP screen layout in your terminal.
+`tools/` also has the tokenizer regression vectors, a multi-turn equivalence test, an FPU flag probe, a quality comparison tool, two on-device benchmarks, a VFPU kernel unit test that runs on the console, and a host renderer that prints the PSP screen layout in your terminal.
 
 ## Generation Examples:
 
