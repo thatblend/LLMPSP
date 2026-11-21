@@ -1148,8 +1148,11 @@ the card even if power is lost a moment later. It records:
   POWER_SWITCH) via a scePower callback;
 - generation end status and clean exit.
 
-An optional cpu_mhz.txt beside the EBOOT (100..333, default 333) lowers
-the CPU/bus clock for power-delivery experiments. The v1.2/v1.3 on-device
+There is no clock setting (v1.4 removed cpu_mhz). The app only enforces
+a minimum: a clock below 333 MHz is raised to 333/166, and anything at
+or above 333 (a CFW setting or an overclock plugin) is left untouched. The boot trace logs the reported clock
+and a measured one, because an overclock plugin may not change the
+reported value. The v1.2/v1.3 on-device
 traces produced by this instrumentation localized the deterministic crash
 to prompt position 3, layer 5, which led directly to the silu overflow
 root cause described in section 2.2. With on-device stability confirmed,

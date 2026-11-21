@@ -103,6 +103,37 @@ static void setup_fpu(void) {
     __asm__ volatile ("ctc1 %0, $31" : : "r"(fcr));
 }
 
+/* The CPU runs at least at 333 MHz: homebrew often starts at 222, so a
+ * lower clock is raised to 333/166. A clock already at or above 333 (CFW
+ * setting or overclock plugin) is left exactly as it is, never lowered.
+ * Returns what it did, for the trace. */
+static const char *ensure_min_clock(void) {
+    if (scePowerGetCpuClockFrequency() >= 333) return "left as set";
+    scePowerSetClockFrequency(333, 333, 166);
+    return "raised to the 333 minimum";
+}
+
+/* Real CPU speed, for the trace: an overclock plugin may not change what
+ * scePowerGetCpuClockFrequency reports. Times a three-instruction loop
+ * whose taken branch makes it 5.04 cycles per iteration (measured on a
+ * PSP-2000, tools/bench_psp.c); about 30 ms at 333 MHz. */
+static unsigned int measure_mhz(void) {
+    unsigned int n = 2000000u, started, elapsed;
+    started = sceKernelGetSystemTimeLow();
+    __asm__ volatile (
+        ".set push\n"
+        ".set noreorder\n"
+        "1:\n"
+        "addiu  %[n], %[n], -1\n"
+        "bnez   %[n], 1b\n"
+        "nop\n"
+        ".set pop\n"
+        : [n] "+r"(n));
+    elapsed = sceKernelGetSystemTimeLow() - started;
+    if (!elapsed) return 0;
+    return (unsigned int)(2000000.0 * 5.04 / (double)elapsed);
+}
+
 static int exit_callback(int arg1, int arg2, void *common) {
     (void)arg1; (void)arg2; (void)common;
     exiting = 1;
@@ -314,12 +345,11 @@ static int read_config_int(const char *model_path, const char *filename,
 
 /* All user-tunable settings live in llmpsp_config.cfg beside the EBOOT
  * as simple "key = value" lines ('#' starts a comment). The legacy
- * cache_mb.txt and cpu_mhz.txt files are still honored when present but
+ * cache_mb.txt file is still honored when present but
  * the config file overrides them. Every value is clamped to a safe
  * range. */
 typedef struct {
     int cache_mb;        /* heap weight-cache target, 0..46 MiB */
-    int cpu_mhz;         /* 100..333 */
     int volatile_mem;    /* 1 = borrow the firmware's 4 MiB volatile RAM */
     int prefetch;        /* 1 = async weight reads; measured useless on the
                           * PSP-2000 memory stick (CPU-bound driver), so
@@ -357,7 +387,6 @@ static void load_config(const char *model_path, AppConfig *cfg) {
     char *slash;
     FILE *file;
     cfg->cache_mb = read_config_int(model_path, "cache_mb.txt", 44);
-    cfg->cpu_mhz = read_config_int(model_path, "cpu_mhz.txt", 333);
     cfg->volatile_mem = 1;
     cfg->prefetch = 0;
     cfg->stripe = 0;
@@ -384,7 +413,6 @@ static void load_config(const char *model_path, AppConfig *cfg) {
                     continue;
                 if (key[0] == '#') continue;
                 if (!strcmp(key, "cache_mb")) cfg->cache_mb = atoi(value);
-                else if (!strcmp(key, "cpu_mhz")) cfg->cpu_mhz = atoi(value);
                 else if (!strcmp(key, "volatile_mem"))
                     cfg->volatile_mem = atoi(value) != 0;
                 else if (!strcmp(key, "prefetch"))
@@ -413,7 +441,6 @@ static void load_config(const char *model_path, AppConfig *cfg) {
         }
     }
     cfg->cache_mb = clamp_int(cfg->cache_mb, 0, 46);
-    cfg->cpu_mhz = clamp_int(cfg->cpu_mhz, 100, 333);
     cfg->context = clamp_int(cfg->context, FALCON_MIN_CONTEXT,
                              FALCON_MAX_CONTEXT);
     cfg->top_k = clamp_int(cfg->top_k, 1, 64);
@@ -494,7 +521,6 @@ int main(int argc, char **argv) {
     pspDebugScreenInit();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    scePowerSetClockFrequency(333, 333, 166);
     /* Block automatic and switch-initiated suspend for the whole session:
      * suspending with CFW extra RAM in use is not survivable. */
     lock_rc = scePowerLock(0);
@@ -513,20 +539,21 @@ int main(int argc, char **argv) {
     trace_line("[stage] power lock rc 0x%08x, guard thread 0x%08x",
                lock_rc, guard_rc);
     load_config(model_path, &config);
-    trace_line("[cfg] cache %d MiB, %d MHz, volatile %d, prefetch %d, "
+    trace_line("[cfg] cache %d MiB, volatile %d, prefetch %d, "
                "stripe %d, ctx %d, fit %d, state_f16 %d, temp %d.%02d, "
                "max reply %d",
-               config.cache_mb, config.cpu_mhz, config.volatile_mem,
+               config.cache_mb, config.volatile_mem,
                config.prefetch, config.stripe, config.context, config.fit,
                config.state_f16, (int)config.temperature,
                (int)(config.temperature * 100.0f) % 100,
                config.max_reply_tokens);
     {
-        int mhz = config.cpu_mhz;
-        if (mhz != 333) scePowerSetClockFrequency(mhz, mhz, mhz / 2);
-        trace_line("[stage] clock %d/%d MHz, free partition %u KiB",
+        int before = scePowerGetCpuClockFrequency();
+        const char *action = ensure_min_clock();
+        trace_line("[stage] clock %d -> %d/%d MHz (%s), measured about "
+                   "%u MHz, free partition %u KiB", before,
                    scePowerGetCpuClockFrequency(),
-                   scePowerGetBusClockFrequency(),
+                   scePowerGetBusClockFrequency(), action, measure_mhz(),
                    (unsigned)(sceKernelTotalFreeMemSize() / 1024));
     }
     trace_power_state("boot");
